@@ -1,0 +1,2447 @@
+"""
+implicit_euler_skeleton.py - Implicit Euler with Newton's iteration.
+
+Scaffolding for Week 2. The structure, plotting, and test harness are provided.
+Your job is to complete the marked sections:
+
+    [TASK 1]  implement the RHS of the Robertson problem (stiff benchmark)
+    [TASK 2]  implement the Jacobian (analytic) of the Robertson RHS
+    [TASK 3]  implement one Newton step for the implicit Euler equation
+    [TASK 4]  build your own scipy oracle and cross-check y(40) component-wise
+
+Provided (no code to write, but read the comments):
+    - the solver harness (implicit Euler via Newton, mass check, figures)
+    - the damping switch (0 < damping <= 1) wired into TASK 3's Newton step;
+      Tutorial 2's individual challenge lives in rc_diode_challenge.py
+      (full vs adaptive-damped Newton on an RC-diode circuit)
+    - the explicit-Euler blow-up demo and the frozen-Jacobian estimate
+    - the deep-work hook (Tutorial 2): implement the NEW solver
+      adaptive_implicit_euler --- a step-doubling controller (one step of
+      size h (y_coarse) vs two of h/2 (y_fine));
+      ||y_fine - y_coarse|| is the local-error estimate that drives h
+      (halve if e > tol, double if e < tol/10).  Until it is implemented,
+      main()'s [4] demo prints a "skipped" notice and moves on, so the
+      Lecture-2 lab run (which uses this same file) does not crash
+
+Run with:
+    python implicit_euler_skeleton.py
+
+Outputs: `robertson_implicit.png` (solution) and, once the deep-work
+solver is implemented, `robertson_adaptive_h.png` (accepted step vs t).
+
+Authors: Sirui Li, Yuxuan Li, Yuran Zhou, Yazhi Xue
+Course: Numerical Analysis of ODEs and PDEs
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ---------------------------------------------------------------------------
+# Model: Robertson chemical kinetics (stiff: largest Jacobian eigenvalue
+# ~ 3.4e3, NOT the rate constant 3e7, because y2 stays ~1e-5; stiffness ratio
+# ~ 5e3 during the transient, growing to ~1.6e5 at t=40; mass y1+y2+y3 = 1 is
+# a linear invariant)
+#
+#   y1' = -0.04 y1 + 1e4 y2 y3
+#   y2' =  0.04 y1 - 1e4 y2 y3 - 3e7 y2^2
+#   y3' =  3e7 y2^2
+#   y(0) = [1, 0, 0]
+#
+# Verify against your own oracle: scipy.integrate.solve_ivp with a very tight
+# tolerance (method='BDF' or 'Radau', rtol=1e-12). There is no handed-in
+# reference value in this course - see project brief Section 2, "How to verify without a given answer".
+# Mass conservation: y1 + y2 + y3 = 1 (linear invariant)
+# ---------------------------------------------------------------------------
+
+def robertson_rhs(t, y):
+    """Robertson RHS. y has shape (3,)."""
+    y1, y2, y3 = y
+    # [TASK 1]  return the 3-component derivative as a 1-D array
+    #   dydt = np.array([
+    #       -0.04*y1 + 1e4*y2*y3,
+    #        0.04*y1 - 1e4*y2*y3 - 3e7*y2*y2,
+    #                     3e7*y2*y2,
+    #   ])
+    return np.array([
+        -0.04 * y1 + 1e4 * y2 * y3,
+        0.04 * y1 - 1e4 * y2 * y3 - 3e7 * y2 * y2,
+        3e7 * y2 * y2,
+    ])
+
+
+def robertson_jacobian(t, y):
+    """Analytic 3x3 Jacobian of the Robertson RHS.
+
+    J[i, j] = d f_i / d y_j
+    """
+    y1, y2, y3 = y
+    # [TASK 2]  build the 3x3 matrix J.
+    #
+    #   df1/dy1 = -0.04        df1/dy2 = 1e4*y3      df1/dy3 = 1e4*y2
+    #   df2/dy1 =  0.04        df2/dy2 = -1e4*y3 - 6e7*y2   df2/dy3 = -1e4*y2
+    #   df3/dy1 =  0           df3/dy2 = 6e7*y2      df3/dy3 = 0
+    J = np.zeros((3, 3))
+    J[0, 0] = -0.04
+    J[0, 1] = 1e4 * y3
+    J[0, 2] = 1e4 * y2
+    J[1, 0] = 0.04
+    J[1, 1] = -1e4 * y3 - 6e7 * y2
+    J[1, 2] = -1e4 * y2
+    J[2, 0] = 0.0
+    J[2, 1] = 6e7 * y2
+    J[2, 2] = 0.0
+    return J
+
+
+# ---------------------------------------------------------------------------
+# Newton's iteration for the implicit Euler step
+#
+# Implicit Euler:  y_{n+1} = y_n + h f(t_{n+1}, y_{n+1})
+# Rearranged:      F(w) = w - y_n - h f(t_{n+1}, w) = 0
+# Newton:          w <- w - J_F(w)^{-1} F(w),  J_F(w) = I - h J_f(w)
+# ---------------------------------------------------------------------------
+
+# trace=True prints the residual ||F||_inf per iteration (lightning-talk
+# diagnostic); line_search=True adds the backtracking (adaptive) damping
+# you implement as [TASK B] of the Tutorial-2 individual challenge
+# (rc_diode_challenge.py), replayed here on Robertson (implemented in the
+# reference); the scaffold itself leaves both False.
+def newtonsolve_implicit_euler(f, jac, t_next, y_n, h, tol=1e-12, max_iter=30,
+                              damping=1.0, trace=False, line_search=False):
+    """Solve the implicit Euler equation for y_{n+1}.
+
+    Returns (y_next, converged).
+    """
+    w = y_n.copy()          # initial guess: value from previous time step
+    for _ in range(max_iter):
+        # residual F(w) = w - y_n - h f(t_next, w)
+        F = w - y_n - h * f(t_next, w)
+        residual_norm = np.linalg.norm(F, np.inf)
+        # trace=True (passed from main()) prints the residual here - the
+        # lightning-talk demo on the first step needs no extra code
+        if trace:
+            print(f"        ||F||_inf = {residual_norm:.3e}")
+        if residual_norm < tol:
+            return w, True
+        # [TASK 3]  Newton step:
+        #   JF = I - h * jac(t_next, w)
+        #   delta = np.linalg.solve(JF, F)
+        #   w = w - damping * delta
+        # Require 0 < damping <= 1.  Adaptive damping (backtracking on the
+        # same delta) is [TASK B] of the Tutorial-2 individual challenge,
+        # rc_diode_challenge.py.
+        # (replace the pass below)
+        JF = np.eye(w.shape[0]) - h * jac(t_next, w)
+        delta = np.linalg.solve(JF, F)
+        w = w - damping * delta
+
+    return w, False
+
+
+def implicit_euler_step(f, jac, t, y, h):
+    """One implicit Euler step using Newton's iteration."""
+    y_next, converged = newtonsolve_implicit_euler(f, jac, t + h, y, h)
+    if not converged:
+        raise RuntimeError(f"Newton failed to converge at t={t:.3f}")
+    return y_next
+
+
+def solve_implicit_euler(f, jac, y0, t0, t1, h):
+    """Integrate with nominal step h, shortened at the end to land on t1."""
+    n_steps = int(np.ceil((t1 - t0) / h))
+    t = np.empty(n_steps + 1)
+    t[0] = t0
+    y = np.zeros((n_steps + 1,) + np.shape(y0))
+    y[0] = y0
+    for n in range(n_steps):
+        step = min(h, t1 - t[n])
+        t[n + 1] = t[n] + step
+        y[n + 1] = implicit_euler_step(f, jac, t[n], y[n], step)
+    return t, y
+
+
+# ---------------------------------------------------------------------------
+# Deep-work (Tutorial 2): adaptive step-size controller (step doubling)
+#
+# A NEW solver, parallel to solve_implicit_euler above.  The step h is
+# driven by the method's own local-error signal instead of staying fixed:
+#     y_coarse = one  implicit Euler step of size h
+#     y_fine   = two  implicit Euler steps of size h/2
+#     e = ||y_fine - y_coarse||   (an O(h^2) local-error estimate)
+# Controller: accept if e <= tol; halve h if e > tol; double h (up to h0)
+# if e < tol/10.  Accept y_fine (the more accurate of the two candidates).
+# ---------------------------------------------------------------------------
+
+def adaptive_implicit_euler(f, jac, y0, t0, t1, h0, tol):
+    """Step-doubling adaptive implicit Euler.
+
+    Returns (t, y, h_used): the accepted grid, the solution on it, and the
+    step actually taken at each accepted step (len(h_used) + 1 == len(t)).
+    """
+    t = [t0]
+    y = [np.array(y0, dtype=float)]
+    h_used = []
+    h = h0
+    # Controller loop (step doubling).
+    #   * one step of size h        -> y_coarse
+    #   * two steps of size h/2     -> y_fine   (accepted when e <= tol)
+    #   * e = ||y_fine - y_coarse||_inf is an O(h^2) local-error estimate
+    #   * accept: append (t+h, y_fine, h); double h when e < tol/10 (cap h0)
+    #   * reject: halve h and retry from the SAME (t, y)
+    attempts = 0
+    max_attempts = 500000          # guard against a pathological h collapse
+    while t[-1] < t1:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError("adaptive_implicit_euler: step-count guard tripped")
+        h = min(h, t1 - t[-1])     # never overshoot the end
+        y_coarse = implicit_euler_step(f, jac, t[-1], y[-1], h)
+        y_half = implicit_euler_step(f, jac, t[-1], y[-1], h / 2)
+        y_fine = implicit_euler_step(f, jac, t[-1] + h / 2, y_half, h / 2)
+        e = np.linalg.norm(y_fine - y_coarse, np.inf)
+        if e <= tol:
+            t.append(t[-1] + h)
+            y.append(y_fine)
+            h_used.append(h)
+            if e < tol / 10:
+                h = min(2.0 * h, h0)
+        else:
+            h = h / 2
+    return np.array(t), np.array(y), np.array(h_used)
+
+
+# ---------------------------------------------------------------------------
+# Explicit Euler (imported from the Week-1 scaffold or re-implemented here)
+# ---------------------------------------------------------------------------
+
+def euler_step(f, t, y, h):
+    return y + h * f(t, y)
+
+
+def solve_euler(f, y0, t0, t1, h):
+    """Use nominal step h; shorten the final step to land exactly at t1."""
+    n_steps = int(np.ceil((t1 - t0) / h))
+    t = np.empty(n_steps + 1)
+    t[0] = t0
+    y = np.zeros((n_steps + 1,) + np.shape(y0))
+    y[0] = y0
+    for n in range(n_steps):
+        step = min(h, t1 - t[n])
+        t[n + 1] = t[n] + step
+        y[n + 1] = euler_step(f, t[n], y[n], step)
+    return t, y
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print("implicit_euler_skeleton.py - Newton for stiff problems")
+    print("=" * 60)
+
+    y0 = np.array([1.0, 0.0, 0.0])
+    t0, t1 = 0.0, 40.0
+    h = 0.1
+
+    # 1. cross-check against YOUR OWN tight-tolerance oracle.
+    #    [TASK 4]  Build it with scipy.integrate.solve_ivp and compare ALL
+    #    three components at t=40:
+    #      from scipy.integrate import solve_ivp
+    #      sol = solve_ivp(robertson_rhs, [t0, t1], y0,
+    #                      method='BDF', rtol=1e-12, atol=1e-14)
+    #      y_oracle = sol.y[:, -1]        # tight reference, shape (3,)
+    #    There is no handed-out value here - learning to construct and trust a
+    #    reference is the exercise. (Sanity: every relative error < 1%.)
+    # 1b. lightning-talk demo: Newton residual on the FIRST step (t = 0.1).
+    #     trace=True makes newtonsolve_implicit_euler print ||F||_inf per
+    #     Newton iteration.  Expect it to RISE on the first full step (the
+    #     initial guess y2 = 0 is a degenerate point where the 3e7*y2^2 term
+    #     is dormant) and then decay quadratically - show this live.
+    newtonsolve_implicit_euler(robertson_rhs, robertson_jacobian, t0 + h, y0, h,
+                               trace=True)
+    t, y = solve_implicit_euler(robertson_rhs, robertson_jacobian, y0, t0, t1, h)
+    y_end = y[-1]
+    from scipy.integrate import solve_ivp
+    sol = solve_ivp(robertson_rhs, [t0, t1], y0, method='BDF', rtol=1e-12, atol=1e-14)
+    y_oracle = sol.y[:, -1]
+    if y_oracle is None:
+        print(f"[1] implicit Euler h={h}:  y(40) = {y_end}  (build your scipy "
+              f"oracle in [TASK 4] to see the comparison)")
+    else:
+        print(f"[1] implicit Euler h={h}:  y(40) vs oracle (rel. err per component):")
+        for i, name in enumerate(["y1", "y2", "y3"]):
+            rel = abs(y_end[i] - y_oracle[i]) / abs(y_oracle[i])
+            print(f"    {name}(40) = {y_end[i]:.6e}  vs oracle {y_oracle[i]:.6e}  "
+                  f"(rel. err = {rel:.3%})")
+
+    # 2. mass conservation
+    mass = y.sum(axis=1)
+    ok2 = np.max(np.abs(mass - 1.0)) < 1e-10
+    print(f"[2] mass conservation: max|sum-1| = {np.max(np.abs(mass-1.0)):.2e} "
+          f"-> {'PASS' if ok2 else 'FAIL'}")
+    # For the lightning talk: plot (mass - 1) vs. t to show the drift curve,
+    # e.g. ax.plot(t, mass - 1.0) on a log scale.  A clean line at ~0 means
+    # the RHS/Newton solve preserves the linear invariant.
+
+    # 3. explicit Euler is impractical: it blows up even with thousands of steps
+    #    Theory: the largest Jacobian eigenvalue is ~3.4e3 (NOT the rate
+    #    constant 3e7, since y2 ~ 1e-5), so Forward Euler stability needs
+    #    h < 2/3.4e3 ~ 5.9e-4, i.e. ~7e4 steps for T=40. Running h=0.01 (only
+    #    4000 steps) already fails.
+    #    (The overflow warnings from the blow-up are EXPECTED - that is the point.)
+    t_full = 40.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        tE, yE = solve_euler(robertson_rhs, y0, 0.0, t_full, 0.01)
+    finite = np.all(np.isfinite(yE))
+    h_max = 2.0 / 3393.0
+    n_steps_theory = int(np.ceil(t_full / h_max))
+    print(f"[3] explicit Euler h=0.01 over T=40 ({len(tE)} steps): "
+          f"{'finite' if finite else 'blow-up (inf/nan)'}")
+    print(f"    frozen-Jacobian estimate near the most restrictive sampled state: "
+          f"h < {h_max:.2e} "
+          f"-> ~{n_steps_theory:,} steps for T=40 (impractical)")
+
+    # 4. deep-work demo (Tutorial 2): fixed vs adaptive step size.
+    #    The controller should shrink h through the stiff transient and
+    #    grow back toward h0 once the solution relaxes.  tol=2e-6 sits
+    #    inside the local-error range at h=0.1 (e ~ 3.6e-5 at t=0 decaying
+    #    to ~1.4e-7 at t=40), so the transient misses the budget (halve)
+    #    and the relaxed tail beats it comfortably (double).  Try other
+    #    tolerances and watch what happens to the h(t) curve.
+    #    Lecture-2 note: adaptive_implicit_euler is still a stub until the
+    #    Tutorial-2 deep work, so this demo is guarded below -- it prints a
+    #    notice and moves on instead of crashing the Week-2 lab run.
+    #    Re-run main() after the deep work to get the comparison and the
+    #    h(t) figure.
+    tol = 2e-6
+    try:
+        tA, yA, hA = adaptive_implicit_euler(robertson_rhs, robertson_jacobian,
+                                             y0, t0, t1, h0=h, tol=tol)
+    except NotImplementedError:
+        print("[4] deep-work demo skipped: adaptive_implicit_euler is not "
+              "implemented yet (Tutorial-2 deep work).")
+        tA = yA = hA = None
+    if tA is not None:
+        print(f"[4] deep-work demo: fixed h={h} vs adaptive (start h0={h}, "
+              f"tol={tol:g}):")
+        print(f"    accepted steps:  fixed {len(t) - 1}   vs adaptive {len(hA)}")
+        print(f"    smallest h reached: {hA.min():.3e}   (final h: {hA[-1]:.3e})")
+        if y_oracle is not None:
+            print(f"    final error vs oracle (inf-norm):")
+            print(f"      fixed    y(40) = {y_end}   e_inf = "
+                  f"{np.max(np.abs(y_end - y_oracle)):.3e}")
+            print(f"      adaptive y(40) = {yA[-1]}   e_inf = "
+                  f"{np.max(np.abs(yA[-1] - y_oracle)):.3e}")
+        else:
+            print("    (build your scipy oracle in [TASK 4] to get the error comparison)")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(tA[:-1], hA, marker=".", ls="-")
+        ax.axhline(h, color="k", ls=":", lw=1, label=f"fixed h = {h}")
+        ax.set_xlabel("t"); ax.set_ylabel("accepted step h")
+        ax.set_title("Robertson problem - adaptive implicit Euler (step doubling)")
+        ax.set_yscale("log"); ax.legend(); ax.grid(True, ls=":", alpha=0.6)
+        fig.tight_layout(); fig.savefig("robertson_adaptive_h.png", dpi=150); plt.close(fig)
+
+    # 5. figures
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(t, y[:, 0], label="y1 (A)")
+    ax.plot(t, y[:, 1] * 1e4, label="y2 (B) x 1e4")
+    ax.plot(t, y[:, 2], label="y3 (C)")
+    ax.set_xlabel("t"); ax.set_ylabel("concentration")
+    ax.set_title("Robertson problem - implicit Euler, h=0.1")
+    ax.legend(); ax.grid(True, ls=":", alpha=0.6)
+    ax.set_xscale("log")
+    fig.tight_layout(); fig.savefig("robertson_implicit.png", dpi=150); plt.close(fig)
+
+    print("=" * 60)
+    print("ALL TESTS PASS" if ok2 else "SOME TESTS FAIL - see above")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+rc_diode_challenge.py - Full vs adaptive-damped Newton for one implicit
+Euler step in a two-node RC circuit with a diode.
+
+Individual challenge, Tutorial 2.  The physics is given; your job is the
+Newton iteration and the experiment.
+
+Circuit (SI units): R1 = R2 = 100 ohm, C1 = C2 = 10 uF, Vs = 5 V,
+diode  I_D(v2) = Is (exp(v2/VT) - 1),  Is = 1e-12 A,  VT = 25.85 mV.
+The physical time scale is RC = 1 ms, so h = 1 ms is a natural step, not
+an artificially huge one.
+
+The model (Kirchhoff's current law) is the ODE system
+    C1 v1' = (Vs - v1)/R1 - (v1 - v2)/R2          v1(0) = 0
+    C2 v2' = (v1 - v2)/R2 - Is*(exp(v2/VT) - 1)   v2(0) = 0
+The stiff unknown is the diode exponential in the v2 equation.
+
+One implicit Euler step from v_n to v solves F(v) = 0 with
+    F1 = C1 (v1-v1n)/h - (Vs-v1)/R1 + (v1-v2)/R2
+    F2 = C2 (v2-v2n)/h - (v1-v2)/R2 + Is*(exp(v2/VT) - 1)
+and J = dF/dv is given below.
+
+Why this problem?  At the FIRST step from v_n = (0,0), h = 1 ms:
+  * full Newton jumps to v2 ~ 1 V (the diode current there is ~6e4 A -- a
+    linearization artifact), then retreats by one thermal voltage
+    VT ~ 26 mV per iteration: 21 iterations to reach tol = 1e-12.
+  * backtracking damping rejects the overshooting step and converges in 6.
+The same protection matters later, every time v2 crosses the diode turn-on
+region (v2 ~ 0.4-0.6 V) with a step that is too large.
+
+Your tasks:
+    [TASK A]  one FULL Newton step:        w <- w + delta
+    [TASK B]  ADAPTIVE damping: backtracking on the SAME delta -- halve
+              the step length until ||F|| strictly decreases; rejected
+              trial steps do NOT count as iterations
+    [TASK C]  the experiment: for each h on the doubling grid, integrate
+              over [0, 20 ms] and record the MAX number of Newton
+              iterations over ALL time steps; find the largest h for which
+              every Newton solve converges in <= 10 iterations, for full
+              and for adaptive-damped Newton; print the table.
+
+Deliverable (report + Individual-Challenge DB):
+    the before/after pair  h_max(full) -> h_max(damped)  and the
+    iteration table that justifies it.
+
+The h = 1 ms first-step reference values are given on the Tutorial 2 slide
+(full Newton: spike then ~V_T retreat, 21 iterations; adaptive damped:
+monotone, 6 iterations) -- your traces must reproduce them.  F and J below
+follow from the model.
+
+Run with:
+    python rc_diode_challenge.py
+
+Authors: Sirui Li, Yuxuan Li, Yuran Zhou, Yazhi Xue
+Course: Numerical Analysis of ODEs and PDEs
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Circuit parameters and the implicit-Euler equations (given)
+# ---------------------------------------------------------------------------
+
+R1 = R2 = 100.0
+C1 = C2 = 10e-6
+Vs = 5.0
+Is = 1e-12
+VT = 0.02585
+T = 20e-3          # simulation horizon: 20 RC time constants (RC = 1 ms)
+GRID_MS = [0.1, 0.2, 0.4, 0.8, 1.0, 2.0, 4.0, 8.0, 20.0]  # doubling grid, ms
+MAX_NEWTON_ITER = 10   # the challenge criterion
+
+
+def F(v, v_n, h):
+    """Residual of the implicit-Euler equations, shape (2,).  F(v) = 0 at
+    the step solution."""
+    v1, v2 = v
+    v1n, v2n = v_n
+    return np.array([
+        C1*(v1 - v1n)/h - (Vs - v1)/R1 + (v1 - v2)/R2,
+        C2*(v2 - v2n)/h - (v1 - v2)/R2 + Is*(np.exp(v2/VT) - 1),
+    ])
+
+
+def J(v, h):
+    """2x2 Jacobian dF/dv."""
+    v1, v2 = v
+    return np.array([
+        [C1/h + 1/R1 + 1/R2,          -1/R2],
+        [-1/R2,       C2/h + 1/R2 + (Is/VT)*np.exp(v2/VT)],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Newton's iteration for one implicit Euler step
+# ---------------------------------------------------------------------------
+
+def newton_step(v_n, h, mode, tol=1e-12, max_iter=300):
+    """Solve F(v) = 0 for one implicit-Euler step, starting from the warm
+    start v_n (the previous time step's value).
+
+    mode='full'   -> [TASK A] full Newton
+    mode='damped' -> [TASK B] adaptive damping (backtracking line search)
+
+    Returns (v_next, n_iter, converged).  n_iter counts ACCEPTED Newton
+    steps only; backtracking trial steps do not count.
+    """
+    w = v_n.copy()
+    n_iter = 0
+    for _ in range(max_iter):
+        f = F(w, v_n, h)
+        r = np.linalg.norm(f)
+        if r < tol:
+            return w, n_iter, True
+        delta = np.linalg.solve(J(w, h), -f)   # Newton direction (both modes)
+        if mode == "full":
+            # [TASK A] full Newton step:
+            w = w + delta
+            n_iter += 1
+        else:
+            # [TASK B] adaptive damping on the SAME delta (backtracking):
+            #   halve lam until ||F|| strictly decreases; rejected trial
+            #   steps do not count as iterations.
+            lam = 1.0
+            for _ in range(60):                      # safety cap on trials
+                w_try = w + lam * delta
+                if np.linalg.norm(F(w_try, v_n, h)) < r:
+                    break
+                lam /= 2.0
+            w = w + lam * delta
+            n_iter += 1
+    return w, n_iter, False
+
+
+# ---------------------------------------------------------------------------
+# Simulation harness (given)
+# ---------------------------------------------------------------------------
+
+def simulate(h, mode):
+    """Integrate over [0, T] with nominal step h.  Returns
+    (v_end, max_iter_over_all_steps, all_converged)."""
+    v = np.zeros(2)
+    t = 0.0
+    max_iter = 0
+    # Use a shortened final step whenever T/h is not an integer.  Rounding the
+    # number of steps would stop at 16 ms for h=8 ms, rather than at T=20 ms.
+    time_tol = 10.0 * np.finfo(float).eps * max(1.0, T)
+    while t < T - time_tol:
+        step = min(h, T - t)
+        v, n_iter, ok = newton_step(v, step, mode)
+        max_iter = max(max_iter, n_iter)
+        if not ok:
+            return v, max_iter, False
+        t += step
+    return v, max_iter, True
+
+
+def main():
+    print("=" * 68)
+    print("rc_diode_challenge.py - full vs adaptive-damped Newton")
+    print("criterion: every Newton solve over [0, 20 ms] converges")
+    print(f"           in <= {MAX_NEWTON_ITER} iterations")
+    print("=" * 68)
+
+    # [TASK C]  the experiment.
+    #   For each h in GRID_MS, run simulate(h*1e-3, 'full') and
+    #   simulate(h*1e-3, 'damped'), record the max iteration counts.
+    #   Print the table:
+    #       h[ms] | full maxit | damped maxit | full <=10? | damped <=10?
+    #   then report the largest h that passes for each mode:
+    #       "largest h with every step <= 10 iterations:  full = ... ms,
+    #        damped = ... ms"
+    #   (A mode passes at every h on this grid -> report '20.0 = T').
+    # first-step reference check (Tutorial 2 slide: full 21, damped 6 at h = 1 ms)
+    with np.errstate(over="ignore", invalid="ignore"):
+        _, n_full_1ms, ok_f = newton_step(np.zeros(2), 1e-3, "full")
+        _, n_damp_1ms, ok_d = newton_step(np.zeros(2), 1e-3, "damped")
+    print(f"first step at h=1 ms:  full Newton = {n_full_1ms} iters "
+          f"(converged={ok_f}) | backtracking = {n_damp_1ms} iters "
+          f"(converged={ok_d})")
+    print("  (Tutorial-2 slide reference: full 21, damped 6)")
+    print()
+
+    # [TASK C] the experiment: doubling grid, max Newton iterations per h.
+    print(f"{'h[ms]':>7} | {'full maxit':>10} | {'damped maxit':>12} | "
+          f"{'full<=10':>9} | {'damped<=10':>10}")
+    print("-" * 68)
+    h_max_full = None
+    h_max_damped = None
+    for g in GRID_MS:
+        h = g * 1e-3
+        with np.errstate(over="ignore", invalid="ignore"):
+            _, mi_full, ok_full = simulate(h, "full")
+            _, mi_damp, ok_damp = simulate(h, "damped")
+        p_full = ok_full and mi_full <= MAX_NEWTON_ITER
+        p_damp = ok_damp and mi_damp <= MAX_NEWTON_ITER
+        if p_full:
+            h_max_full = g
+        if p_damp:
+            h_max_damped = g
+        print(f"{g:>7.1f} | {mi_full:>10} | {mi_damp:>12} | "
+              f"{str(p_full):>9} | {str(p_damp):>10}")
+
+    def fmt(x):
+        if x is None:
+            return "none on this grid"
+        return f"{x:.1f} ms" + ("   (= T)" if abs(x - T * 1e3) < 1e-9 else "")
+
+    print("-" * 68)
+    print(f"largest h with every step <= {MAX_NEWTON_ITER} iterations:")
+    print(f"    full Newton              = {fmt(h_max_full)}")
+    print(f"    Newton with backtracking = {fmt(h_max_damped)}")
+    print(f"    -> deliverable: h_max(full) = {h_max_full} ms  ->  "
+          f"h_max(damped) = {h_max_damped} ms")
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+euler_skeleton.py - Explicit Euler scaffolding for the ODE IVP project.
+
+This is a FILL-IN-THE-BLANK template. The structure, plotting, and test harness
+are provided. Your job is to complete the four marked sections:
+
+    [TASK 1]  implement the vectorized RHS of the logistic equation
+    [TASK 2]  implement the explicit Euler step
+    [TASK 3]  implement the convergence study (error vs h)
+    [TASK 4]  implement the stability-threshold experiment
+
+Run with:
+    python euler_skeleton.py
+
+When all four tasks are complete, the script prints PASS/FAIL diagnostics and
+produces two figures: `euler_logistic.png` and `euler_convergence.png`.
+
+Authors: Sirui Li, Yuxuan Li, Yuran Zhou, Yazhi Xue
+Course: Numerical Analysis of ODEs and PDEs
+"""
+
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ---------------------------------------------------------------------------
+# Model: logistic growth  y' = r y (1 - y/K)
+#
+# Note the RHS is written for a VECTOR y of shape (n_states,) - for a scalar
+# problem n_states = 1. Keep the vector signature: it costs nothing and makes
+# the scaffold work for the coupled systems in the problem pack.
+# ---------------------------------------------------------------------------
+
+def logistic_rhs(t, y):
+    """Right-hand side of the logistic equation.
+
+    Parameters
+    ----------
+    t : float
+        Current time (unused by an autonomous ODE, kept for API compatibility).
+    y : ndarray, shape (1,)
+        Current state.
+
+    Returns
+    -------
+    f : ndarray, shape (1,)
+        Derivative dy/dt at (t, y).
+    """
+    r = 1.0    # growth rate
+    K = 10.0   # carrying capacity
+    # [TASK 1]  return r * y * (1 - y / K)  as a 1-D numpy array of shape (1,)
+    # (hint: y is already a length-1 array; multiply element-wise)
+    return r * y * (1.0 - y / K)
+
+
+# ---------------------------------------------------------------------------
+# Explicit (forward) Euler:  y_{n+1} = y_n + h f(t_n, y_n)
+# ---------------------------------------------------------------------------
+
+def euler_step(f, t, y, h):
+    """One explicit Euler step.
+
+    Parameters
+    ----------
+    f : callable
+        RHS function f(t, y) -> ndarray.
+    t : float
+        Current time.
+    y : ndarray
+        Current state.
+    h : float
+        Step size.
+
+    Returns
+    -------
+    y_next : ndarray
+        Approximate state at t + h.
+    """
+    # [TASK 2]  one line:  y_next = y + h * f(t, y)
+    return y + h * f(t, y)
+
+
+def solve_euler(f, y0, t0, t1, h):
+    """Integrate f from t0 to t1 with fixed step h using explicit Euler.
+
+    Returns (t, Y): the time grid and the solution trajectory. The requested
+    h is a nominal maximum step; the final step is shortened so t[-1] == t1.
+    For an order study, prefer h=(t1-t0)/N with integer N, so every run uses a
+    genuinely uniform grid and the x-axis is unambiguous.
+    """
+    n_steps = int(np.ceil((t1 - t0) / h))
+    t = np.empty(n_steps + 1)
+    t[0] = t0
+    y = np.zeros((n_steps + 1,) + np.shape(y0))
+    y[0] = y0
+    for n in range(n_steps):
+        step = min(h, t1 - t[n])
+        t[n + 1] = t[n] + step
+        y[n + 1] = euler_step(f, t[n], y[n], step)
+    return t, y
+
+
+# ---------------------------------------------------------------------------
+# Reference solution: the logistic equation has a closed-form solution
+# ---------------------------------------------------------------------------
+
+def logistic_exact(t, y0, r=1.0, K=10.0):
+    """Closed-form solution of y' = r y (1 - y/K)."""
+    return K / (1 + (K / y0 - 1) * np.exp(-r * t))
+
+
+# ---------------------------------------------------------------------------
+# Convergence study: global error at fixed T vs step size h
+# ---------------------------------------------------------------------------
+
+def convergence_study(f, y0, t0, t1, h_values, exact, plot_path=None):
+    """Estimate the observed order of convergence.
+
+    Choose h values that divide t1-t0 exactly. For each h, integrate to t1 and
+    measure the L2 norm of the full-state error
+    ||y_approx(t1) - y_exact(t1)||_2, so the same code works for scalar
+    problems and systems. Then fit log(error) ~ order * log(h).
+
+    `exact` is a function exact(t) -> float for a scalar state, or an ndarray
+    of the same shape as the state for a system.
+
+    Returns (errors, order).
+    """
+    h_values = np.asarray(h_values, dtype=float)
+    duration = t1 - t0
+    ratios = duration / h_values
+    if not np.allclose(ratios, np.round(ratios), rtol=0.0, atol=1e-12):
+        raise ValueError("For an order study, choose h=(t1-t0)/N with integer N")
+    errors = []
+    for h in h_values:
+        t, y = solve_euler(f, y0, t0, t1, h)
+        # [TASK 3a]  compute the full-state error at the final time
+        #   err = np.linalg.norm(y[-1] - exact(t[-1]))
+        # The L2 norm covers all components, so the same line works for a
+        # scalar state (shape (1,)) and for a system (shape (d,)).
+        err = np.linalg.norm(y[-1] - exact(t[-1]))
+        errors.append(err)
+
+    errors = np.asarray(errors)
+    # [TASK 3b]  fit a straight line in log-log space using np.polyfit
+    #   slope, intercept = np.polyfit(np.log(h_values), np.log(errors), 1)
+    # and use the slope as the observed order.
+    slope, intercept = np.polyfit(np.log(h_values), np.log(errors), 1)
+    order = slope
+
+    if plot_path is not None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.loglog(h_values, errors, "o-", label="explicit Euler")
+
+        # theoretical slope: overlay the order-1 reference line
+        # (visualization guide, Rule 1 --- no benchmark, no claim)
+        h_lin = np.logspace(np.log10(h_values.min()), np.log10(h_values.max()), 50)
+        c_ref = errors[0] / h_values[0]
+        ax.loglog(h_lin, c_ref * h_lin**1.0, "k--", label="order-1 reference")
+
+        # confidence band on the fitted slope
+        # (visualization guide, Rule 1 --- polyfit with cov=True)
+        if order > 0:
+            coef, cov = np.polyfit(np.log(h_values), np.log(errors), 1, cov=True)
+            slope_err = np.sqrt(cov[0, 0])
+            lx = np.linspace(np.log(h_values.min()), np.log(h_values.max()), 50)
+            line = coef[0] * lx + coef[1]
+            se = np.sqrt(cov[1, 1] + 2 * lx * cov[0, 1] + lx**2 * cov[0, 0])
+            ax.loglog(np.exp(lx), np.exp(line), "r--",
+                      label=f"fit {order:.2f} \u00b1 {slope_err:.2f}")
+            ax.fill_between(np.exp(lx), np.exp(line - 1.96 * se),
+                            np.exp(line + 1.96 * se),
+                            color="r", alpha=0.15, label="95% band")
+
+        # annotate the round-off floor: error stops falling at small h
+        floor_idx = int(np.argmin(errors))
+        if floor_idx < len(h_values) - 1:
+            ax.annotate("round-off floor",
+                        xy=(h_values[floor_idx], errors[floor_idx]),
+                        xytext=(h_values[floor_idx] * 4, errors[floor_idx] * 4),
+                        arrowprops=dict(arrowstyle="->"))
+
+        ax.set_xlabel("step size h")
+        ax.set_ylabel("global error at T")
+        ax.set_title(f"observed order about {order:.2f} (theory: 1.00)")
+        ax.grid(True, which="both", ls=":", alpha=0.6)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+
+    return errors, order
+
+
+# ---------------------------------------------------------------------------
+# Stability experiment: linear model  y' = lambda y,  |1 + h lambda| <= 1
+# ---------------------------------------------------------------------------
+
+def stability_threshold():
+    """Find the largest h for which explicit Euler stays bounded on y' = -y.
+
+    Theory: stability requires |1 - h| <= 1  ->  h <= 2. Above h = 2 the
+    solution should oscillate and grow. Returns (h_inside, h_outside).
+
+    NB: just above the boundary the growth per step is only ~1.1x, so a long
+    horizon is needed for the growth to become visible. T = 200 gives
+    ~95 steps at h = 2.1 -> 1.1^95 ~ 10^4, clearly unstable.
+    """
+    lam = -1.0
+    y0 = np.array([1.0])
+    t0, t1 = 0.0, 200.0
+    f_linear = lambda t, y: lam * y     # y' = -y
+
+    def test_stable(h):
+        t, y = solve_euler(f_linear, y0, t0, t1, h)
+        # [TASK 4]  return True if |y[-1]| stays bounded (e.g. <= 10), False otherwise.
+        return bool(np.abs(y[-1, 0]) <= 10.0)
+
+    # the probes are given: just inside (h = 1.9) and just outside (h = 2.1)
+    # the stability boundary  |1 - h| <= 1   (i.e. h <= 2)
+    h_inside = 1.9
+    h_outside = 2.1
+    assert test_stable(h_inside), f"expected stability at h={h_inside}"
+    assert not test_stable(h_outside), f"expected instability at h={h_outside}"
+    return h_inside, h_outside
+
+
+# ---------------------------------------------------------------------------
+# Main: run everything and print PASS/FAIL
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print("euler_skeleton.py - explicit Euler scaffolding")
+    print("=" * 60)
+
+    # figures are written next to this script (not the CWD), so the output
+    # works regardless of where the interpreter is launched from
+    output_dir = Path(__file__).resolve().parent
+
+    y0 = np.array([0.5])
+    t0, t1 = 0.0, 10.0
+    h = 0.05
+
+    # 1. sanity run
+    t, y = solve_euler(logistic_rhs, y0, t0, t1, h)
+    final = y[-1, 0]
+    exact_final = logistic_exact(t[-1], y0[0])
+    ok1 = abs(final - exact_final) < 0.2
+    print(f"[1] logistic t=10:  euler={final:.4f}  exact={exact_final:.4f}  "
+          f"|err|={abs(final - exact_final):.4f}  -> {'PASS' if ok1 else 'FAIL'}")
+    # note: order-1 method with h=0.05 over t=10 gives error ~ 0.05*scale, so 0.2 is a loose bound
+
+    # 2. convergence
+    h_values = [0.4, 0.2, 0.1, 0.05, 0.025]
+    errors, order = convergence_study(
+        logistic_rhs, y0, t0, t1, h_values,
+        lambda tt: logistic_exact(tt, y0[0]),   # scalar-valued exact solution
+        plot_path=output_dir / "euler_convergence.png",
+    )
+    ok2 = 0.7 <= order <= 1.3
+    print(f"[2] observed order = {order:.2f}  (theory 1.00) -> {'PASS' if ok2 else 'FAIL'}")
+
+    # your own error table --- these are YOUR numbers from TASK 3a; the
+    # instructor compares them against the reference (no expected values here)
+    print("  Your error table (global error at t=10, each h):")
+    print(f"  {'h':>8} {'error':>14}")
+    for hh, e in zip(h_values, errors):
+        print(f"  {hh:>8.4f} {e:>14.6e}")
+
+    # 3. stability threshold
+    h_in, h_out = stability_threshold()
+    ok3 = True
+    print(f"[3] stable at h={h_in}, unstable at h={h_out} (theory: boundary h=2) -> "
+          f"{'PASS' if ok3 else 'FAIL'}")
+
+    # 4. trajectory figure
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(t, y[:, 0], label="explicit Euler (h=0.05)")
+    ax.plot(t, logistic_exact(t, y0[0]), "k--", label="exact")
+    ax.set_xlabel("t"); ax.set_ylabel("y")
+    ax.set_title("Logistic growth")
+    ax.legend(); ax.grid(True, ls=":", alpha=0.6)
+    fig.tight_layout(); fig.savefig(output_dir / "euler_logistic.png", dpi=150); plt.close(fig)
+
+    print("=" * 60)
+    all_ok = ok1 and ok2 and ok3
+    print("ALL TESTS PASS" if all_ok else "SOME TESTS FAIL - see above")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+failure_case_vanderpol.py — "Failure case" generator for Week 2 Lecture.
+
+Demonstrates the catastrophic failure of explicit Euler on the Van der Pol
+oscillator, motivating implicit / stiff-aware methods.
+
+    y1' = y2
+    y2' = mu * (1 - y1^2) * y2 - y1
+
+For mu = 10 the system is mildly stiff in the relaxation phase. Explicit Euler
+requires h ~ 1/(3 mu) in the stiff phase, far below what accuracy alone would
+need; a modest h that looks "small enough" still blows up.
+
+Run with:
+    python failure_case_vanderpol.py
+
+Outputs:
+    vanderpol_euler_blowup.png      — one large-h Euler run vs a reference
+    vanderpol_h_sweep.png           — final-time error vs h, log-log
+
+Authors: Sirui Li, Yuxuan Li, Yuran Zhou, Yazhi Xue
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def vanderpol_rhs(t, y, mu=10.0):
+    y1, y2 = y
+    return np.array([y2, mu * (1.0 - y1 ** 2) * y2 - y1])
+
+
+def euler_step(f, t, y, h):
+    return y + h * f(t, y)
+
+
+def solve_euler(f, y0, t0, t1, h):
+    """Use nominal step h and shorten only the final step to land exactly at t1."""
+    n_steps = int(np.ceil((t1 - t0) / h))
+    t = np.empty(n_steps + 1)
+    t[0] = t0
+    y = np.zeros((n_steps + 1,) + np.shape(y0))
+    y[0] = y0
+    for n in range(n_steps):
+        step = min(h, t1 - t[n])
+        t[n + 1] = t[n] + step
+        y[n + 1] = euler_step(f, t[n], y[n], step)
+    return t, y
+
+
+def reference_solution(y0, t0, t1):
+    """Stiff-aware reference, independently checked by tolerance tightening."""
+    from scipy.integrate import solve_ivp
+    base = solve_ivp(
+        vanderpol_rhs, (t0, t1), y0, method="Radau",
+        rtol=1e-10, atol=1e-12, dense_output=True
+    )
+    tight = solve_ivp(
+        vanderpol_rhs, (t0, t1), y0, method="Radau",
+        rtol=1e-12, atol=1e-14, dense_output=True
+    )
+    check_times = np.linspace(t0, t1, 1001)
+    discrepancy = np.max(np.abs(base.sol(check_times) - tight.sol(check_times)))
+    if not (base.success and tight.success and discrepancy < 1e-7):
+        raise RuntimeError(
+            "Radau reference failed its tightened-tolerance check: "
+            f"success=({base.success}, {tight.success}), discrepancy={discrepancy:.3e}"
+        )
+    return tight, discrepancy
+
+
+def main():
+    y0 = np.array([2.0, 0.0])
+    t0, t1 = 0.0, 20.0
+
+    # ---- Part 1: one blow-up run vs reference --------------------------
+    h_bad = 0.1
+    with np.errstate(over="ignore", invalid="ignore"):
+        t, y = solve_euler(vanderpol_rhs, y0, t0, t1, h_bad)
+    sol, reference_discrepancy = reference_solution(y0, t0, t1)
+    t_ref = np.linspace(t0, t1, 4000)
+    y_ref = sol.sol(t_ref)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(t_ref, y_ref[0], "k-", lw=1.5,
+            label="reference (Radau, tightened tolerances)")
+    ax.plot(t, y[:, 0], "r-", lw=1.0, label=f"explicit Euler, h={h_bad}")
+    ax.set_xlabel("t"); ax.set_ylabel("y1")
+    ax.set_title("Van der Pol (mu=10): explicit Euler blows up while the true\n"
+                 "solution stays bounded — the classic stiff failure case")
+    ax.legend(); ax.grid(True, ls=":", alpha=0.6)
+    fig.tight_layout(); fig.savefig("vanderpol_euler_blowup.png", dpi=150)
+
+    # ---- Part 2: error vs h -------------------------------------------
+    h_values = [0.4, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005]
+    errs = []
+    for h in h_values:
+        with np.errstate(over="ignore", invalid="ignore"):
+            _, yh = solve_euler(vanderpol_rhs, y0, t0, t1, h)
+        errs.append(np.abs(yh[-1] - y_ref[:, -1]).max())
+
+    fig2, ax2 = plt.subplots(figsize=(7, 5))
+    ax2.loglog(h_values, errs, "o-", label="explicit Euler error at T=20")
+    # reference order-1 line
+    h_lin = np.logspace(-2.4, -0.4, 30)
+    ax2.loglog(h_lin, 0.05 * h_lin, "k--", label="order-1 reference line")
+    ax2.set_xlabel("step size h")
+    ax2.set_ylabel("global error")
+    ax2.set_title("Van der Pol (mu=10): error does NOT follow order 1 until h is\n"
+                  "small enough to enter the stability region — then it drops")
+    ax2.legend(); ax2.grid(True, which="both", ls=":", alpha=0.5)
+    fig2.tight_layout(); fig2.savefig("vanderpol_h_sweep.png", dpi=150)
+
+    print("Figures written: vanderpol_euler_blowup.png, vanderpol_h_sweep.png")
+    print("Radau tolerance-tightening discrepancy:", f"{reference_discrepancy:.3e}")
+    finite_values = np.abs(y[:, 0][np.isfinite(y[:, 0])])
+    peak_before_failure = np.max(finite_values) if finite_values.size else np.nan
+    status = "became non-finite" if not np.all(np.isfinite(y)) else "remained finite"
+    print(f"Note for the lecture: Euler with h=0.1 {status}; "
+          f"largest finite |y1| before failure = {peak_before_failure:.1e}")
+
+
+if __name__ == "__main__":
+    main()
+"""
+rk4_skeleton.py - Classical RK4 scaffolding for the ODE IVP project.
+
+Built from euler_skeleton.py per the Lecture-2 checklist: the Euler step is
+replaced by the four-stage classical RK4 update, and the expected convergence
+order / stability boundary are adapted to RK4.
+
+Run with:
+    python rk4_skeleton.py
+
+On success the script prints PASS/FAIL diagnostics and produces
+`rk4_logistic.png` and `rk4_convergence.png`.
+
+Authors: Sirui Li, Yuxuan Li, Yuran Zhou, Yazhi Xue
+Course: Numerical Analysis of ODEs and PDEs
+"""
+
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ---------------------------------------------------------------------------
+# Model: logistic growth  y' = r y (1 - y/K)   (same as euler_skeleton)
+# ---------------------------------------------------------------------------
+
+def logistic_rhs(t, y):
+    r = 1.0    # growth rate
+    K = 10.0   # carrying capacity
+    return r * y * (1.0 - y / K)
+
+
+# ---------------------------------------------------------------------------
+# Classical Runge-Kutta (RK4)
+# ---------------------------------------------------------------------------
+
+def rk4_step(f, t, y, h):
+    """One classical RK4 step (four function evaluations).
+
+    k1 = f(t, y)
+    k2 = f(t + h/2, y + h/2 k1)
+    k3 = f(t + h/2, y + h/2 k2)
+    k4 = f(t + h,   y + h k3)
+    y_{n+1} = y_n + h/6 (k1 + 2 k2 + 2 k3 + k4)
+    """
+    k1 = f(t, y)
+    k2 = f(t + h / 2, y + h / 2 * k1)
+    k3 = f(t + h / 2, y + h / 2 * k2)
+    k4 = f(t + h, y + h * k3)
+    return y + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+def solve_rk4(f, y0, t0, t1, h):
+    """Integrate f from t0 to t1 with fixed step h using RK4."""
+    n_steps = int(np.ceil((t1 - t0) / h))
+    t = np.empty(n_steps + 1)
+    t[0] = t0
+    y = np.zeros((n_steps + 1,) + np.shape(y0))
+    y[0] = y0
+    for n in range(n_steps):
+        step = min(h, t1 - t[n])
+        t[n + 1] = t[n] + step
+        y[n + 1] = rk4_step(f, t[n], y[n], step)
+    return t, y
+
+
+def logistic_exact(t, y0, r=1.0, K=10.0):
+    """Closed-form solution of y' = r y (1 - y/K)."""
+    return K / (1 + (K / y0 - 1) * np.exp(-r * t))
+
+
+# ---------------------------------------------------------------------------
+# Convergence study (order 4)
+# ---------------------------------------------------------------------------
+
+def convergence_study(f, y0, t0, t1, h_values, exact, plot_path=None):
+    h_values = np.asarray(h_values, dtype=float)
+    duration = t1 - t0
+    ratios = duration / h_values
+    if not np.allclose(ratios, np.round(ratios), rtol=0.0, atol=1e-12):
+        raise ValueError("For an order study, choose h=(t1-t0)/N with integer N")
+    errors = []
+    for h in h_values:
+        t, y = solve_rk4(f, y0, t0, t1, h)
+        err = np.linalg.norm(y[-1] - exact(t[-1]))
+        errors.append(err)
+
+    errors = np.asarray(errors)
+    slope, intercept = np.polyfit(np.log(h_values), np.log(errors), 1)
+    order = slope
+
+    if plot_path is not None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.loglog(h_values, errors, "o-", label="classical RK4")
+
+        h_lin = np.logspace(np.log10(h_values.min()), np.log10(h_values.max()), 50)
+        c_ref = errors[0] / h_values[0] ** 4.0
+        ax.loglog(h_lin, c_ref * h_lin**4.0, "k--", label="order-4 reference")
+
+        if order > 0:
+            coef, cov = np.polyfit(np.log(h_values), np.log(errors), 1, cov=True)
+            slope_err = np.sqrt(cov[0, 0])
+            lx = np.linspace(np.log(h_values.min()), np.log(h_values.max()), 50)
+            line = coef[0] * lx + coef[1]
+            se = np.sqrt(cov[1, 1] + 2 * lx * cov[0, 1] + lx**2 * cov[0, 0])
+            ax.loglog(np.exp(lx), np.exp(line), "r--",
+                      label=f"fit {order:.2f} \u00b1 {slope_err:.2f}")
+            ax.fill_between(np.exp(lx), np.exp(line - 1.96 * se),
+                            np.exp(line + 1.96 * se),
+                            color="r", alpha=0.15, label="95% band")
+
+        floor_idx = int(np.argmin(errors))
+        if floor_idx < len(h_values) - 1:
+            ax.annotate("round-off floor",
+                        xy=(h_values[floor_idx], errors[floor_idx]),
+                        xytext=(h_values[floor_idx] * 4, errors[floor_idx] * 4),
+                        arrowprops=dict(arrowstyle="->"))
+
+        ax.set_xlabel("step size h")
+        ax.set_ylabel("global error at T")
+        ax.set_title(f"observed order about {order:.2f} (theory: 4.00)")
+        ax.grid(True, which="both", ls=":", alpha=0.6)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+
+    return errors, order
+
+
+# ---------------------------------------------------------------------------
+# Stability experiment: y' = -y with RK4
+#
+# RK4 stability function R(z) = 1 + z + z^2/2 + z^3/6 + z^4/24.
+# On the negative real axis z = -h the boundary |R(-h)| = 1 sits at h ~ 2.785.
+# ---------------------------------------------------------------------------
+
+def stability_threshold():
+    lam = -1.0
+    y0 = np.array([1.0])
+    t0, t1 = 0.0, 200.0
+    f_linear = lambda t, y: lam * y
+
+    def test_stable(h):
+        t, y = solve_rk4(f_linear, y0, t0, t1, h)
+        return bool(np.abs(y[-1, 0]) <= 10.0)
+
+    h_inside = 2.5    # just inside  (|R(-2.5)| ~ 0.65 < 1)
+    h_outside = 3.0   # just outside (|R(-3.0)| ~ 1.38 > 1)
+    assert test_stable(h_inside), f"expected stability at h={h_inside}"
+    assert not test_stable(h_outside), f"expected instability at h={h_outside}"
+    return h_inside, h_outside
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print("rk4_skeleton.py - classical RK4 scaffolding")
+    print("=" * 60)
+
+    output_dir = Path(__file__).resolve().parent
+
+    y0 = np.array([0.5])
+    t0, t1 = 0.0, 10.0
+    h = 0.05
+
+    # 1. sanity run
+    t, y = solve_rk4(logistic_rhs, y0, t0, t1, h)
+    final = y[-1, 0]
+    exact_final = logistic_exact(t[-1], y0[0])
+    ok1 = abs(final - exact_final) < 0.2
+    print(f"[1] logistic t=10:  rk4={final:.8f}  exact={exact_final:.8f}  "
+          f"|err|={abs(final - exact_final):.3e}  -> {'PASS' if ok1 else 'FAIL'}")
+
+    # 2. convergence (order 4)
+    h_values = [0.2, 0.1, 0.05, 0.025, 0.0125]
+    errors, order = convergence_study(
+        logistic_rhs, y0, t0, t1, h_values,
+        lambda tt: logistic_exact(tt, y0[0]),
+        plot_path=output_dir / "rk4_convergence.png",
+    )
+    ok2 = 3.5 <= order <= 4.5
+    print(f"[2] observed order = {order:.2f}  (theory 4.00) -> {'PASS' if ok2 else 'FAIL'}")
+
+    print("  Your error table (global error at t=10, each h):")
+    print(f"  {'h':>8} {'error':>14}")
+    for hh, e in zip(h_values, errors):
+        print(f"  {hh:>8.4f} {e:>14.6e}")
+
+    # 3. stability threshold (RK4 boundary ~ 2.785)
+    h_in, h_out = stability_threshold()
+    ok3 = True
+    print(f"[3] stable at h={h_in}, unstable at h={h_out} (theory: boundary h~2.785) -> "
+          f"{'PASS' if ok3 else 'FAIL'}")
+
+    # 4. trajectory figure
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(t, y[:, 0], label="classical RK4 (h=0.05)")
+    ax.plot(t, logistic_exact(t, y0[0]), "k--", label="exact")
+    ax.set_xlabel("t"); ax.set_ylabel("y")
+    ax.set_title("Logistic growth")
+    ax.legend(); ax.grid(True, ls=":", alpha=0.6)
+    fig.tight_layout(); fig.savefig(output_dir / "rk4_logistic.png", dpi=150); plt.close(fig)
+
+    print("=" * 60)
+    all_ok = ok1 and ok2 and ok3
+    print("ALL TESTS PASS" if all_ok else "SOME TESTS FAIL - see above")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+rk4_stability_region.py — Plot the absolute-stability region of Runge-Kutta
+methods (Euler, RK4, implicit Euler) as filled contours.
+
+This script plots the three method regions and overlays eigenvalues of the
+Robertson Jacobian at t=40, scaled by a practically relevant step size. The
+core idea is:
+
+    The stability region of a one-step method applied to y' = lambda y with
+    z = h lambda is the set of z where |R(z)| <= 1, where R is the stability
+    function of the method.
+
+    Euler:          R(z) = 1 + z
+    RK4:            R(z) = 1 + z + z^2/2 + z^3/6 + z^4/24
+    Implicit Euler: R(z) = 1 / (1 - z)
+
+Run with:
+    python rk4_stability_region.py
+
+Output: `stability_regions.png` — the three regions overlaid on the complex
+z-plane. Use this figure in your report's stability section.
+
+The helper `plot_system_eigenvalues(ax, J, h)` computes h * eig(J) and
+scatters it on each region. Treat the overlay as a local frozen-Jacobian
+diagnostic, not a sufficient stability proof for a nonlinear, time-varying,
+or non-normal system. The separate step sweep verifies its prediction.
+
+Authors: Sirui Li, Yuxuan Li, Yuran Zhou, Yazhi Xue
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+
+Y0 = np.array([1.0, 0.0, 0.0])
+T_END = 40.0
+
+
+def robertson_rhs(t, y):
+    """Robertson mass-action model."""
+    y1, y2, y3 = y
+    return np.array([-0.04 * y1 + 1e4 * y2 * y3,
+                     0.04 * y1 - 1e4 * y2 * y3 - 3e7 * y2 * y2,
+                     3e7 * y2 * y2])
+
+
+def robertson_jacobian(y):
+    """Analytic Jacobian of the Robertson right-hand side."""
+    y1, y2, y3 = y
+    return np.array([[-0.04, 1e4 * y3, 1e4 * y2],
+                     [0.04, -1e4 * y3 - 6e7 * y2, -1e4 * y2],
+                     [0.0, 6e7 * y2, 0.0]])
+
+
+def R_euler(z):
+    """Stability function of explicit Euler."""
+    return 1.0 + z
+
+
+def R_rk4(z):
+    """Stability function of the classical Runge-Kutta 4 method."""
+    return 1.0 + z + z ** 2 / 2.0 + z ** 3 / 6.0 + z ** 4 / 24.0
+
+
+def R_implicit_euler(z):
+    """Stability function of implicit (backward) Euler."""
+    return 1.0 / (1.0 - z)
+
+
+def stability_region(R, z_grid):
+    """Boolean mask where |R(z)| <= 1."""
+    return np.abs(R(z_grid)) <= 1.0
+
+
+def plot_system_eigenvalues(ax, J, h, color="tab:orange",
+                            label=r"Robertson $h\lambda$ at $t=40$"):
+    """Overlay h * eig(J) on one stability region.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+        One of the three stability-region subplots.
+    J : ndarray, shape (d, d)
+        The Jacobian of YOUR system, evaluated at the operating point.
+        A scalar is accepted and treated as a 1x1 matrix.
+    h : float
+        The step size you plan to use.
+
+    The plotted points are the eigenvalues of J scaled by h: z = h lambda.
+    If any point falls OUTSIDE a method's region, that method should be
+    unstable at this h --- predict it, then verify by running the solver.
+    """
+    lam = np.linalg.eigvals(np.atleast_2d(J))
+    pts = h * lam
+    ax.scatter(pts.real, pts.imag, s=70, marker="x", color=color,
+               label=label, zorder=5)
+
+
+def main():
+    # grid in the complex plane: z = x + i y
+    x = np.linspace(-4.0, 3.0, 1200)
+    y = np.linspace(-4.0, 4.0, 1200)
+    X, Y = np.meshgrid(x, y)
+    Z = X + 1j * Y
+
+    region_euler = stability_region(R_euler, Z)
+    region_rk4 = stability_region(R_rk4, Z)
+    region_ie = stability_region(R_implicit_euler, Z)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+
+    for ax, (name, region, color) in zip(
+        axes,
+        [
+            ("Explicit Euler", region_euler, "tab:blue"),
+            ("RK4", region_rk4, "tab:green"),
+            ("Implicit Euler", region_ie, "tab:red"),
+        ],
+    ):
+        ax.contourf(X, Y, region, levels=[0.5, 1.5], colors=[color], alpha=0.35)
+        ax.contour(X, Y, region, levels=[0.5], colors=[color], linewidths=1.2)
+        # axis and labels
+        ax.axhline(0, color="k", lw=0.6)
+        ax.axvline(0, color="k", lw=0.6)
+        ax.set_xlim(-4, 3)
+        ax.set_ylim(-4, 4)
+        ax.set_xlabel("Re(z)")
+        ax.set_ylabel("Im(z)")
+        ax.set_title(name)
+        ax.set_aspect("equal")
+        ax.grid(True, ls=":", alpha=0.4)
+
+    # Robertson overlay.  h=8.2e-4 is close to the empirical RK4 stability
+    # boundary.  At t=40 the fastest mode is approximately -3.39e3, so its
+    # scaled value is near -2.78: outside Euler's disc, near RK4's boundary,
+    # and inside implicit Euler's left-half-plane region.
+    ref = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="Radau",
+                    rtol=1e-12, atol=1e-14, t_eval=[T_END])
+    if not ref.success:
+        raise RuntimeError("Radau reference solve failed")
+    J_robertson = robertson_jacobian(ref.y[:, -1])
+    h_overlay = 8.2e-4
+    eigvals = np.linalg.eigvals(J_robertson)
+    print("Robertson eigenvalues at t=40:", eigvals)
+    print("scaled values h*lambda for h=8.2e-4:", h_overlay * eigvals)
+    for ax in axes:
+        plot_system_eigenvalues(ax, J_robertson, h_overlay)
+    axes[0].legend(loc="upper left")
+
+    fig.suptitle(
+        "Absolute-stability regions with Robertson overlay "
+        r"($t=40$, $h=8.2\times10^{-4}$)",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    fig.savefig("stability_regions.png", dpi=150)
+    plt.show()
+
+"""
+robertson_cost_matched.py - Cost versus accuracy at a MATCHED accuracy target.
+
+Project Brief, Section 2, item 5 ("Cost versus accuracy", learning outcome D)
+requires all four of the following, and this script supplies each of them:
+
+  1. Name the cost measure BEFORE quoting any number.
+     Primary measure : right-hand-side (RHS) evaluations.
+     Secondary       : wall-clock seconds (best of two runs, same machine,
+                       same process, single-threaded numpy).
+  2. Compare at a matched accuracy target: every method is brought to the same
+     error against our own high-accuracy reference solution, not run at
+     whatever step size happens to look good.
+  3. State what is NOT counted and hold it constant:
+       - not counted in the RHS count : Jacobian assembly and the 3x3 LU
+         factorisation of (I - h J). These are counted separately below
+         (jac_asm, lin_solves) so a reader who disagrees with RHS-weighted
+         counting can re-weight our numbers instead of trusting them.
+       - not counted at all and identical for every method: reference-solution
+         construction, figure production, interpreter start-up. There is no
+         compilation step. The reference solution is built once and excluded
+         from every timing.
+  4. Report the result even where it contradicts the expected winner.
+
+Error norms. Two are reported, because they disagree:
+    endpoint    : ||y_h(40) - y_ref(40)||_inf        (what our report quotes)
+    trajectory  : max_t ||y_h(t) - y_ref(t)||_inf    (stricter; the transient
+                  error is larger than the endpoint error)
+Both are computed against the same reference. The trajectory norm for the
+Euler methods uses linear interpolation of the fixed-step solution onto the
+reference grid; that interpolation error is orders of magnitude below every
+error we report for them.
+
+Run:  python robertson_cost_matched.py
+Outputs: cost_matched.png, cost_matched.csv
+"""
+
+import csv
+import os
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+Y0 = np.array([1.0, 0.0, 0.0])
+T_END = 40.0
+BLOWUP = 1e12
+NEWTON_TOL = 1e-10
+NEWTON_MAXIT = 30
+REPEATS = 2
+
+# The LOOSE target is not a free parameter: it is defined as the error of
+# explicit Euler at the largest step size that is still stable. That is the
+# honest way to ask "can anything beat explicit Euler at its own best stable
+# operating point?", and it avoids the trap of picking a target that happens to
+# sit right on the stability cliff, where explicit Euler's error is dominated
+# by marginal-stability amplification rather than by its truncation error.
+TARGET_STRICT = 1.0e-5
+
+H_EXPLICIT = [1e-3, 8e-4, 6e-4, 5e-4, 4e-4, 3e-4]
+H_RK4 = [2e-3, 1e-3, 8.5e-4, 8.2e-4, 8.0e-4, 5e-4]
+H_IMPLICIT = [2.0, 1.0, 0.8, 0.7, 0.6, 0.5, 0.4, 0.2, 0.1, 0.05, 0.02, 0.01,
+              0.005, 0.003, 0.002, 0.001]
+
+
+# --------------------------------------------------------------------------
+# model
+# --------------------------------------------------------------------------
+
+def rhs(t, y):
+    y1, y2, y3 = y
+    return np.array([-0.04 * y1 + 1e4 * y2 * y3,
+                     0.04 * y1 - 1e4 * y2 * y3 - 3e7 * y2 * y2,
+                     3e7 * y2 * y2])
+
+
+def jacobian(t, y):
+    y1, y2, y3 = y
+    return np.array([[-0.04, 1e4 * y3, 1e4 * y2],
+                     [0.04, -1e4 * y3 - 6e7 * y2, -1e4 * y2],
+                     [0.0, 6e7 * y2, 0.0]])
+
+
+# --------------------------------------------------------------------------
+# integrators, each returning (ok, y_end, t_grid, y_grid, work)
+# --------------------------------------------------------------------------
+
+def run_explicit_euler(h):
+    n = int(np.ceil(T_END / h))
+    t = 0.0
+    y = Y0.copy()
+    ts = np.empty(n + 1)
+    ys = np.empty((n + 1, 3))
+    ts[0], ys[0] = 0.0, y
+    for k in range(n):
+        s = min(h, T_END - t)
+        y = y + s * rhs(t, y)
+        t += s
+        if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > BLOWUP:
+            return False, None, None, None, {"rhs": 0, "steps": 0,
+                                             "jac_asm": 0, "lin_solves": 0,
+                                             "newton_iters": 0, "rejected": 0}
+        ts[k + 1], ys[k + 1] = t, y
+    return True, y, ts, ys, {"rhs": n, "steps": n, "jac_asm": 0,
+                             "lin_solves": 0, "newton_iters": 0, "rejected": 0}
+
+
+def run_rk4(h):
+    n = int(np.ceil(T_END / h))
+    t = 0.0
+    y = Y0.copy()
+    ts = np.empty(n + 1)
+    ys = np.empty((n + 1, 3))
+    ts[0], ys[0] = 0.0, y
+    for k in range(n):
+        s = min(h, T_END - t)
+        k1 = rhs(t, y)
+        k2 = rhs(t + 0.5 * s, y + 0.5 * s * k1)
+        k3 = rhs(t + 0.5 * s, y + 0.5 * s * k2)
+        k4 = rhs(t + s, y + s * k3)
+        y = y + (s / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        t += s
+        if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > BLOWUP:
+            return False, None, None, None, {"rhs": 0, "steps": 0,
+                                             "jac_asm": 0, "lin_solves": 0,
+                                             "newton_iters": 0, "rejected": 0}
+        ts[k + 1], ys[k + 1] = t, y
+    return True, y, ts, ys, {"rhs": 4 * n, "steps": n, "jac_asm": 0,
+                             "lin_solves": 0, "newton_iters": 0, "rejected": 0}
+
+
+def run_implicit_euler(h, tol=NEWTON_TOL):
+    n = int(np.ceil(T_END / h))
+    t = 0.0
+    y = Y0.copy()
+    ts = np.empty(n + 1)
+    ys = np.empty((n + 1, 3))
+    ts[0], ys[0] = 0.0, y
+    newton_iters = 0
+    jac_asm = 0
+    lin_solves = 0
+    for k in range(n):
+        s = min(h, T_END - t)
+        tn = t + s
+        w = y.copy()
+        converged = False
+        for _ in range(NEWTON_MAXIT):
+            F = w - y - s * rhs(tn, w)
+            newton_iters += 1                       # one RHS-style evaluation
+            if np.linalg.norm(F, np.inf) < tol:     # convergence check: no solve
+                converged = True
+                break
+            JF = np.eye(3) - s * jacobian(tn, w)    # Jacobian assembly
+            jac_asm += 1
+            w = w - np.linalg.solve(JF, F)          # 3x3 LU factorise + solve
+            lin_solves += 1
+        if not converged:
+            return False, None, None, None, {"rhs": 0, "steps": 0, "jac_asm": 0,
+                                             "lin_solves": 0,
+                                             "newton_iters": 0, "rejected": 0}
+        y = w
+        t = tn
+        if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > BLOWUP:
+            return False, None, None, None, {"rhs": 0, "steps": 0, "jac_asm": 0,
+                                             "lin_solves": 0,
+                                             "newton_iters": 0, "rejected": 0}
+        ts[k + 1], ys[k + 1] = t, y
+    # Every evaluation of F at line 149 contains exactly one rhs(tn, w)
+    # evaluation, including the final successful convergence check.  Therefore
+    # newton_iters is already the complete RHS count; adding one more check per
+    # time step would double-count that final evaluation.
+    work = {"rhs": newton_iters,
+            "steps": n, "jac_asm": jac_asm, "lin_solves": lin_solves,
+            "newton_iters": newton_iters, "rejected": 0}
+    return True, y, ts, ys, work
+
+
+# --------------------------------------------------------------------------
+# harness: measure one (method, h) run
+# --------------------------------------------------------------------------
+
+def measure(name, fn, h, ref_t, ref_y):
+    t0 = time.perf_counter()
+    ok, y_end, ts, ys, work = fn(h)
+    elapsed = time.perf_counter() - t0
+    if not ok:
+        return {"method": name, "h": h, "ok": False, "wall": elapsed}
+    for _ in range(REPEATS - 1):
+        t1 = time.perf_counter()
+        fn(h)
+        elapsed = min(elapsed, time.perf_counter() - t1)
+    err_end = float(np.max(np.abs(y_end - ref_y[:, -1])))
+    interp = np.column_stack([np.interp(ref_t, ts, ys[:, j]) for j in range(3)])
+    err_traj = float(np.max(np.abs(interp - ref_y.T)))
+    d = {"method": name, "h": h, "ok": True, "steps": work["steps"],
+         "rhs": work["rhs"], "jac_asm": work["jac_asm"],
+         "lin_solves": work["lin_solves"],
+         "newton_iters": work["newton_iters"],
+         "err_end": err_end, "err_traj": err_traj, "wall": elapsed}
+    return d
+
+
+def cheapest(rows, target, key="err_end"):
+    """Fewest RHS evaluations among the runs that meet the target (largest h)."""
+    ok = [r for r in rows if r.get("ok") and r[key] <= target]
+    if not ok:
+        return None
+    return min(ok, key=lambda r: r["rhs"])
+
+
+def main():
+    print("=" * 78)
+    print("robertson_cost_matched.py - cost versus accuracy at a matched target")
+    print("cost measure: RHS evaluations (primary), wall-clock seconds (secondary)")
+    print("=" * 78)
+
+    ref_t = np.concatenate([np.logspace(-8, -1, 3000), np.linspace(0.1, T_END, 3000)])
+    baseline = solve_ivp(rhs, (0.0, T_END), Y0, method="Radau", rtol=1e-10,
+                         atol=1e-12, dense_output=True)
+    ref = solve_ivp(rhs, (0.0, T_END), Y0, method="Radau", rtol=1e-12,
+                    atol=1e-14, dense_output=True)
+    bdf = solve_ivp(rhs, (0.0, T_END), Y0, method="BDF", rtol=1e-12,
+                    atol=1e-14)
+    ref_y = ref.sol(ref_t)
+    tighten_diff = float(np.max(np.abs(ref_y - baseline.sol(ref_t))))
+    method_diff = float(np.max(np.abs(ref.y[:, -1] - bdf.y[:, -1])))
+    print(f"\nreference (Radau, rtol=1e-12, atol=1e-14): y(40) = {ref.y[:, -1]}")
+    print(f"  100x tolerance-tightening check (Radau): {tighten_diff:.3e}")
+    print(f"  independent-method check (Radau vs BDF at t=40): {method_diff:.3e}")
+
+    # ---- eigenvalues along the reference trajectory -----------------------
+    lam_max, t_at = 0.0, 0.0
+    for t, y in zip(ref_t, ref_y.T):
+        m = float(np.max(np.abs(np.linalg.eigvals(jacobian(t, y)))))
+        if m > lam_max:
+            lam_max, t_at = m, t
+    b_euler = 2.0 / lam_max
+    b_rk4 = 2.785 / lam_max
+    print(f"max |lambda| along trajectory = {lam_max:.4e} at t = {t_at:.2f}")
+    print(f"  frozen-Jacobian prediction, explicit Euler : h < {b_euler:.3e}")
+    print(f"  frozen-Jacobian prediction, RK4            : h < {b_rk4:.3e}")
+
+    rows = []
+    print(f"\n  {'method':<10} {'h':>9} {'err_end':>11} {'err_traj':>11} "
+          f"{'steps':>10} {'RHS':>11} {'jac':>9} {'solve':>9} {'wall/s':>8}")
+    print("  " + "-" * 92)
+    for h in H_EXPLICIT:
+        r = measure("explicit", run_explicit_euler, h, ref_t, ref_y)
+        rows.append(r)
+        print("  {:<10} {:>9.1e} {:>11.3e} {:>11.3e} {:>10,} {:>11,} "
+              "{:>9} {:>9} {:>8.2f}".format(
+                  r["method"], r["h"], r["err_end"], r["err_traj"], r["steps"],
+                  r["rhs"], r["jac_asm"], r["lin_solves"], r["wall"])
+              if r["ok"] else
+              f"  {'explicit':<10} {h:>9.1e}   UNSTABLE")
+    for h in H_RK4:
+        r = measure("rk4", run_rk4, h, ref_t, ref_y)
+        rows.append(r)
+        print("  {:<10} {:>9.1e} {:>11.3e} {:>11.3e} {:>10,} {:>11,} "
+              "{:>9} {:>9} {:>8.2f}".format(
+                  r["method"], r["h"], r["err_end"], r["err_traj"], r["steps"],
+                  r["rhs"], r["jac_asm"], r["lin_solves"], r["wall"])
+              if r["ok"] else
+              f"  {'rk4':<10} {h:>9.1e}   UNSTABLE")
+    for h in H_IMPLICIT:
+        r = measure("implicit", lambda hh: run_implicit_euler(hh), h, ref_t, ref_y)
+        rows.append(r)
+        print("  {:<10} {:>9.1e} {:>11.3e} {:>11.3e} {:>10,} {:>11,} "
+              "{:>9,} {:>9,} {:>8.2f}".format(
+                  r["method"], r["h"], r["err_end"], r["err_traj"], r["steps"],
+                  r["rhs"], r["jac_asm"], r["lin_solves"], r["wall"])
+              if r["ok"] else
+              f"  {'implicit':<10} {h:>9.1e}   NEWTON FAILED")
+
+    # ---- empirical stability boundary -------------------------------------
+    def boundary_check(name, bound):
+        ok = sorted([r for r in rows if r["method"] == name and r["ok"]],
+                    key=lambda r: r["h"])
+        bad = sorted([r["h"] for r in rows
+                      if r["method"] == name and not r["ok"]])
+        if len(ok) < 2:
+            return
+        # marginal-stability amplification shows up as a jump in the error as h
+        # approaches the bound, not as a gradual loss of order
+        onset, ratio, h_acc = None, None, None
+        for prev, cur in zip(ok, ok[1:]):
+            if cur["err_end"] > 100.0 * max(prev["err_end"], 1e-16):
+                onset, ratio, h_acc = cur["h"], cur["err_end"] / prev["err_end"], prev["h"]
+                break
+        print(f"  {name:<10} prediction: h < {bound:.3e}")
+        if onset is not None:
+            print(f"  {'':<10} accuracy collapse onset          : {onset:.1e}"
+                  f"   ({ratio:,.0f}x error jump from h = {h_acc:.1e};"
+                  f" bound/onset = {bound / onset:.3f})")
+        if bad:
+            print(f"  {'':<10} first h with no finite solution  : "
+                  f"{min(bad):.1e}")
+
+    print("\n  stability-boundary check: the frozen-Jacobian overlay is a local")
+    print("  diagnostic - does it also predict the FOURTH-order method's edge?")
+    boundary_check("explicit", b_euler)
+    boundary_check("rk4", b_rk4)
+
+    # ---- matched-target tables --------------------------------------------
+    exp_ok = sorted([r for r in rows if r["method"] == "explicit" and r["ok"]],
+                    key=lambda r: r["h"])
+    target_loose = exp_ok[-1]["err_end"]
+    print(f"\n  LOOSE target is derived from the data, not chosen: explicit")
+    print(f"  Euler's largest stable run (h = {exp_ok[-1]['h']:.1e}) has endpoint")
+    print(f"  error {target_loose:.3e}, and every method is brought to at least")
+    print(f"  that accuracy. rk4_floor = "
+          f"{min(r['rhs'] for r in rows if r['method'] == 'rk4' and r['ok']):,} RHS.")
+
+    for label, target in (("LOOSE", target_loose), ("STRICT", TARGET_STRICT)):
+        for norm in ("err_end", "err_traj"):
+            print(f"\n  matched target {label} = {target:.2e}"
+                  f"   norm: {norm}")
+            print(f"  {'method':<10} {'h':>9} {'err':>12} {'steps':>11} "
+                  f"{'RHS':>11} {'jac+sol':>9} {'re-weighted':>12} {'wall/s':>7}")
+            print("  " + "-" * 88)
+            best = {}
+            for name in ("explicit", "rk4", "implicit"):
+                sub = [r for r in rows if r["method"] == name and r["ok"]]
+                b = cheapest(sub, target, key=norm)
+                best[name] = b
+                if b is None:
+                    print(f"  {name:<10} {'-':>9}   no run on the grid meets "
+                          f"this target under this norm")
+                    continue
+                extra = b["jac_asm"] + b["lin_solves"]
+                print(f"  {name:<10} {b['h']:>9.1e} {b[norm]:>12.3e} "
+                      f"{b['steps']:>11,} {b['rhs']:>11,} {extra:>9,} "
+                      f"{b['rhs'] + extra:>12,} {b['wall']:>7.2f}")
+            if best.get("explicit") and best.get("implicit"):
+                e, i = best["explicit"], best["implicit"]
+                ex = e["jac_asm"] + e["lin_solves"]
+                ix = i["jac_asm"] + i["lin_solves"]
+                rr = e["rhs"] / i["rhs"]
+                rw = (e["rhs"] + ex) / (i["rhs"] + ix)
+                print(f"    -> implicit vs explicit: {rr:.2f}x on the primary RHS "
+                      f"count ({'implicit wins' if rr > 1 else 'implicit LOSES'})")
+                print(f"       re-weighted, charging implicit for every Jacobian "
+                      f"assembly and every 3x3 solve")
+                print(f"       ({i['rhs'] + ix:,} vs {e['rhs'] + ex:,} units): "
+                      f"{rw:.2f}x "
+                      f"({'implicit still wins' if rw > 1 else 'implicit now LOSES'})")
+            if best.get("rk4") and best.get("explicit"):
+                print(f"    -> RK4 vs explicit: {best['rk4']['rhs'] / best['explicit']['rhs']:.1f}x "
+                      f"MORE RHS for accuracy the problem does not need")
+
+    # ---- what was not counted ---------------------------------------------
+    print("\n  what is NOT counted")
+    print("    - Jacobian assembly and the 3x3 LU factorisation are excluded "
+          "from the RHS count;")
+    print("      they are reported separately (jac, solve) so the breakdown is "
+          "re-weightable.")
+    print("    - identical for all methods and excluded from every timing: "
+          "reference-solution")
+    print("      construction, figure production, interpreter start-up. No "
+          "compilation step exists.")
+
+    # ---- csv --------------------------------------------------------------
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "cost_matched.csv")
+    with open(out, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["method", "h", "ok", "steps", "rhs",
+                                           "jac_asm", "lin_solves",
+                                           "newton_iters", "err_end",
+                                           "err_traj", "wall"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in w.fieldnames})
+    print(f"\n  table written to {os.path.basename(out)}")
+
+    # ---- figure -----------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.2))
+    style = {"explicit": ("tab:red", "o", "explicit Euler (1 RHS/step)"),
+             "rk4": ("tab:blue", "s", "RK4 (4 RHS/step)"),
+             "implicit": ("tab:green", "^", "implicit Euler + Newton")}
+    for ax, reweight in zip(axes, (False, True)):
+        for name, (c, m, lab) in style.items():
+            sub = [r for r in rows if r["method"] == name and r["ok"]]
+            if not sub:
+                continue
+            sub.sort(key=lambda r: r["rhs"])
+            x = [r["rhs"] + (r["jac_asm"] + r["lin_solves"] if reweight else 0)
+                 for r in sub]
+            ax.loglog(x, [r["err_traj"] for r in sub], m + "-", color=c,
+                      ms=4, label=lab)
+        ax.axhline(target_loose, color="gray", ls=":", lw=1.4,
+                   label=f"matched target {target_loose:.2e}")
+        ax.set_xlabel("cost (work units)"
+                      + ("  = RHS + Jacobian assembly + 3x3 solve" if reweight
+                         else "  = RHS evaluations"))
+        ax.set_ylabel(r"max over trajectory of $\|$error$\|_\infty$")
+        ax.set_title("re-weighted: implicit Euler is charged for\nJacobians and solves"
+                     if reweight else "primary measure: RHS evaluations only")
+        ax.grid(True, which="both", ls=":", alpha=0.5)
+        ax.legend(fontsize=8.5, loc="lower left")
+    axes[0].annotate("RK4 hits a stability floor:\nit cannot buy accuracy\nbelow ~1.9e5 RHS",
+                     xy=(188236, 2.7e-3), xytext=(0.38, 0.83),
+                     textcoords="axes fraction", fontsize=8.5,
+                     color="tab:blue",
+                     arrowprops=dict(arrowstyle="->", color="tab:blue", lw=1))
+    fig.suptitle("Robertson: cost versus accuracy at matched accuracy "
+                 "(trajectory norm)", fontsize=12)
+    fig.tight_layout()
+    png = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "cost_matched.png")
+    fig.savefig(png, dpi=150)
+    plt.close(fig)
+    print(f"  figure written to {os.path.basename(png)}")
+    print("=" * 78)
+
+
+if __name__ == "__main__":
+    main()
+
+if __name__ == "__main__":
+    main()
+"""
+robertson_euler_limits.py — Problem Pack ③ (Robertson): where explicit Euler
+fails, and how non-negativity behaves.
+
+Covers two report requirements:
+    * "Show where explicit Euler becomes unstable, inaccurate, or negative.
+       Compare implicit Euler at matched error; 'it did not blow up' is not an
+       accuracy claim."
+    * "Track conservation y1+y2+y3 = 1, componentwise non-negativity, and
+       full-state error as separate diagnostics."
+
+Three separate criteria are reported independently:
+    stable   : the run stays finite and bounded
+    positive : no component ever goes below -1e-10
+    accurate : ||y_h(40) - y_ref(40)||_inf <= ACC_TOL
+
+Run:  python robertson_euler_limits.py
+Outputs: robertson_euler_limits.png, robertson_nonnegativity.png
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+Y0 = np.array([1.0, 0.0, 0.0])
+T_END = 40.0
+ACC_TOL = 1e-2          # accuracy criterion, stated explicitly
+NEG_TOL = -1e-10        # tolerance for calling a component "non-negative"
+BLOWUP = 1e12           # abort threshold for an obviously diverging run
+
+H_LIST = [2e-2, 1e-2, 5e-3, 2e-3, 1e-3, 6e-4, 5e-4, 4e-4, 3e-4, 2e-4, 1e-4]
+
+# theoretical frozen-Jacobian bound quoted in the problem pack
+H_THEORY = 5.9e-4
+
+
+def robertson_rhs(t, y):
+    y1, y2, y3 = y
+    return np.array([
+        -0.04 * y1 + 1e4 * y2 * y3,
+        0.04 * y1 - 1e4 * y2 * y3 - 3e7 * y2 * y2,
+        3e7 * y2 * y2,
+    ])
+
+
+def robertson_jacobian(t, y):
+    y1, y2, y3 = y
+    return np.array([
+        [-0.04, 1e4 * y3, 1e4 * y2],
+        [0.04, -1e4 * y3 - 6e7 * y2, -1e4 * y2],
+        [0.0, 6e7 * y2, 0.0],
+    ])
+
+
+# --------------------------------------------------------------------------
+# explicit Euler
+# --------------------------------------------------------------------------
+
+def euler_run(h, keep=False):
+    """Explicit Euler to T_END. Returns dict with metrics (+ arrays if keep)."""
+    n = int(np.ceil(T_END / h))
+    t = 0.0
+    y = Y0.copy()
+    miny = np.inf
+    ts, ys = ([0.0], [Y0.copy()]) if keep else (None, None)
+    for _ in range(n):
+        step = min(h, T_END - t)
+        with np.errstate(over="ignore", invalid="ignore"):
+            y = y + step * robertson_rhs(t, y)
+        if (not np.all(np.isfinite(y))) or np.max(np.abs(y)) > BLOWUP:
+            return {"stable": False, "miny": miny, "y": None,
+                    "t": np.array(ts) if ts else None,
+                    "traj": np.array(ys) if ys else None}
+        t += step
+        miny = min(miny, float(np.min(y)))
+        if keep:
+            ts.append(t); ys.append(y.copy())
+    return {"stable": True, "miny": miny, "y": y, "t": ts,
+            "traj": np.array(ys) if keep else None}
+
+
+# --------------------------------------------------------------------------
+# implicit Euler with Newton (scaffold-consistent)
+# --------------------------------------------------------------------------
+
+def newton_solve(t_next, y_n, h, tol=1e-12, max_iter=30):
+    w = y_n.copy()
+    for k in range(max_iter):
+        F = w - y_n - h * robertson_rhs(t_next, w)
+        if np.linalg.norm(F, np.inf) < tol:
+            return w, k, True
+        JF = np.eye(3) - h * robertson_jacobian(t_next, w)
+        w = w - np.linalg.solve(JF, F)
+    return w, max_iter, False
+
+
+def implicit_run(h, tol=1e-12):
+    n = int(np.ceil(T_END / h))
+    t = 0.0
+    y = Y0.copy()
+    miny = np.inf
+    defect = 0.0
+    total_iters = 0
+    for _ in range(n):
+        step = min(h, T_END - t)
+        y, its, ok = newton_solve(t + step, y, step, tol=tol)
+        total_iters += its
+        if not ok:
+            return {"ok": False, "miny": miny, "defect": defect, "iters": total_iters}
+        t += step
+        miny = min(miny, float(np.min(y)))
+        defect = max(defect, abs(float(np.sum(y)) - 1.0))
+    return {"ok": True, "miny": miny, "defect": defect, "iters": total_iters, "y": y}
+
+
+def main():
+    print("=" * 72)
+    print("robertson_euler_limits.py - explicit Euler failure boundaries")
+    print(f"criteria: bounded | min(y) >= {NEG_TOL:g} | ||err(40)||_inf <= {ACC_TOL:g}")
+    print("=" * 72)
+
+    ref = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="Radau",
+                    rtol=1e-12, atol=1e-14)
+    y_ref = ref.y[:, -1]
+    print(f"reference (Radau rtol=1e-12) y(40) = {y_ref}")
+
+    # ---------------- sweep ------------------------------------------
+    print(f"\n  {'h':>9} {'stable':>7} {'non-neg':>8} {'accurate':>9} "
+          f"{'min y':>11} {'||err(40)||inf':>15}")
+    print("  " + "-" * 66)
+    rows = []
+    for h in H_LIST:
+        r = euler_run(h)
+        if r["stable"]:
+            err = float(np.max(np.abs(r["y"] - y_ref)))
+            nonneg = r["miny"] >= NEG_TOL
+            acc = err <= ACC_TOL
+        else:
+            err = np.nan
+            nonneg = r["miny"] >= NEG_TOL
+            acc = False
+        rows.append((h, r["stable"], nonneg, acc, r["miny"], err))
+        print(f"  {h:>9.1e} {str(r['stable']):>7} {str(nonneg):>8} {str(acc):>9} "
+              f"{r['miny']:>11.3e} {err:>15.3e}")
+
+    def largest(idx):
+        vals = [r[0] for r in rows if r[idx]]
+        return max(vals) if vals else None
+
+    h_stab = largest(1)
+    h_pos = largest(2)
+    h_acc = largest(3)
+    print("\n  findings")
+    print(f"    largest stable h        : {h_stab:.1e}")
+    print(f"    largest non-negative h  : {h_pos if h_pos else float('nan'):.1e}")
+    print(f"    largest accurate h      : {h_acc if h_acc else float('nan'):.1e}")
+    print(f"    pack frozen-Jacobian    : h < {H_THEORY:.1e}  "
+          f"-> empirical stability boundary matches within a factor "
+          f"{h_stab/H_THEORY:.2f}" if h_stab else "    (no stable h found)")
+
+    # ---------------- matched-error comparison ------------------------
+    if h_acc is None:
+        print("\n  no accurate explicit-Euler run on this grid; widen the grid")
+        target = None
+    else:
+        target = next(r[5] for r in rows if r[0] == h_acc)
+    print(f"\n  matched-error comparison (target error = {target:.2e})")
+    print(f"  {'method':<10} {'h':>9} {'err(40)':>12} {'steps':>9} "
+          f"{'Newton iters':>13} {'RHS evals':>11}")
+    print("  " + "-" * 70)
+    if target is not None:
+        steps_e = int(np.ceil(T_END / h_acc))
+        print(f"  {'explicit':<10} {h_acc:>9.1e} {target:>12.2e} {steps_e:>9} "
+              f"{0:>13} {steps_e:>11}")
+        best = None
+        for h in [0.4, 0.2, 0.1, 0.05, 0.025, 0.0125]:
+            r = implicit_run(h)
+            if not r["ok"]:
+                continue
+            err = float(np.max(np.abs(r["y"] - y_ref)))
+            steps_i = int(np.ceil(T_END / h))
+            # one RHS evaluation per Newton iteration, plus the final
+            # convergence check of every step
+            rhs_i = r["iters"] + steps_i
+            if best is None and err <= target:
+                best = (h, err, r, steps_i, rhs_i)
+            print(f"  {'implicit':<10} {h:>9.1e} {err:>12.2e} "
+                  f"{steps_i:>9} {r['iters']:>13} {rhs_i:>11}")
+        if best:
+            h_i, err_i, r_i, si, rhs_i = best
+            se = int(np.ceil(T_END / h_acc))
+            print(f"\n    cheapest implicit run meeting the target: h = {h_i:g} "
+                  f"(err {err_i:.2e}, better than the explicit target)")
+            print(f"    steps:          explicit {se:,} vs implicit {si:,}"
+                  f"  ->  {se/si:,.0f}x fewer steps")
+            print(f"    RHS evaluations: explicit {se:,} vs implicit {rhs_i:,}"
+                  f"  ->  {se/rhs_i:,.0f}x fewer RHS evaluations")
+            print(f"    (implicit pays a 3x3 linear solve per iteration; still "
+                  f"far cheaper here)")
+
+    # ---------------- figures ----------------------------------------
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    hs = np.array([r[0] for r in rows if r[1]])
+    es = np.array([r[5] for r in rows if r[1]])
+    ax.loglog(hs, es, "o-", color="tab:red", label="explicit Euler, ||err(40)||inf")
+    unstable = [(r[0], r[5]) for r in rows if not r[1]]
+    for h, _ in unstable:
+        ax.axvline(h, color="tab:gray", ls="--", lw=0.8, alpha=0.5)
+    ax.axhline(ACC_TOL, color="tab:green", ls=":", lw=1.5,
+               label=f"accuracy tolerance = {ACC_TOL:g}")
+    ax.axvline(H_THEORY, color="tab:blue", ls="-.", lw=1.5,
+               label=f"frozen-Jacobian bound h<{H_THEORY:.1e}")
+    if h_pos:
+        ax.axvline(h_pos, color="tab:orange", ls=":", lw=1.5,
+                   label=f"positivity limit h={h_pos:.1e}")
+    ax.axvspan(max(hs) * 1.05, max(hs) * 3, color="tab:gray", alpha=0.15)
+    ax.annotate("unstable\n(no finite solution)", xy=(H_LIST[0] * 1.2, 1e0),
+                fontsize=9, color="dimgray")
+    ax.set_xlabel("step size h")
+    ax.set_ylabel("global error at T=40")
+    ax.set_title("Robertson: three separate failure criteria for explicit Euler\n"
+                 "(stability, positivity and accuracy are different questions)")
+    ax.grid(True, which="both", ls=":", alpha=0.5)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig("robertson_euler_limits.png", dpi=150)
+    plt.close(fig)
+
+    # non-negativity diagnostics
+    fig2, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    for h, style in [(1e-3, "-"), (5e-4, "-"), (2e-4, "-")]:
+        r = euler_run(h, keep=True)
+        tt = np.array(r["t"]); yy = r["traj"]
+        mn = yy.min(axis=1)
+        axes[0].semilogx(tt[1:], mn[1:], style, lw=1.2,
+                         label=f"explicit Euler h={h:g}" + ("" if r["stable"] else " (diverges)"))
+        axes[1].loglog(tt[1:], np.maximum(yy[1:, 1], 1e-30), style, lw=1.2,
+                       label=f"explicit Euler h={h:g}")
+    ri = implicit_run(0.1)
+    axes[1].axhline(0, color="k", lw=0.6)
+    axes[0].axhline(0, color="k", lw=0.6)
+    axes[0].axhline(NEG_TOL, color="tab:green", ls=":", lw=1.2, label="non-negativity tolerance")
+    axes[0].set_xlabel("t"); axes[0].set_ylabel("min(y1,y2,y3)")
+    axes[0].set_title("Non-negativity is a separate diagnostic:\nexplicit Euler can go negative")
+    axes[0].grid(True, which="both", ls=":", alpha=0.5); axes[0].legend(fontsize=8)
+    axes[1].set_xlabel("t"); axes[1].set_ylabel("y2 (log scale)")
+    axes[1].set_title("Small component y2 about the early maximum\n(spurious oscillation is a warning sign)")
+    axes[1].grid(True, which="both", ls=":", alpha=0.5); axes[1].legend(fontsize=8)
+    fig2.suptitle("Robertson: conservation alone is weak - watch positivity and y2 behaviour", fontsize=12)
+    fig2.tight_layout()
+    fig2.savefig("robertson_nonnegativity.png", dpi=150)
+    plt.close(fig2)
+
+    print("\nFigures written: robertson_euler_limits.png, robertson_nonnegativity.png")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()
+"""
+robertson_stiffness.py — Problem Pack ③ (Robertson): Jacobian eigenvalues and
+the stiffness ratio along a tight-tolerance reference trajectory.
+
+Covers the report requirement:
+    "Plot both nonzero Jacobian eigenvalues and the defined stiffness ratio
+     against logarithmic time. Explain the structural zero eigenvalue and the
+     treatment of the initial degeneracy."
+
+Method notes
+------------
+* The full 3x3 Jacobian always has exactly one zero eigenvalue, because the
+  mass-conservation invariant makes (1,1,1) a left null vector. Including that
+  eigenvalue makes the stiffness ratio infinite/undefined, so it is excluded
+  with an explicit numerical threshold (ZERO_REL).
+* Cross-check: eliminate y3 = 1 - y1 - y2 and use the 2x2 reduced Jacobian.
+* The plot starts at the first positive logarithmic time: the ratio is not
+  informative at the exactly degenerate initial state.
+
+Run:  python robertson_stiffness.py
+Output: robertson_stiffness.png
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+Y0 = np.array([1.0, 0.0, 0.0])
+T_END = 40.0
+# eigenvalues below this relative size are classified as the structural zero
+ZERO_REL = 1e-9
+# check values quoted in the problem pack (for orientation only)
+CHECK_T = [1e-4, 1e-2, 40.0]
+CHECK_S = [3.0e3, 5.4e3, 1.58e5]
+
+
+def robertson_rhs(t, y):
+    y1, y2, y3 = y
+    return np.array([
+        -0.04 * y1 + 1e4 * y2 * y3,
+        0.04 * y1 - 1e4 * y2 * y3 - 3e7 * y2 * y2,
+        3e7 * y2 * y2,
+    ])
+
+
+def robertson_jacobian(t, y):
+    y1, y2, y3 = y
+    return np.array([
+        [-0.04, 1e4 * y3, 1e4 * y2],
+        [0.04, -1e4 * y3 - 6e7 * y2, -1e4 * y2],
+        [0.0, 6e7 * y2, 0.0],
+    ])
+
+
+def reduced_jacobian(y):
+    """2x2 Jacobian of the reduced system (y3 = 1 - y1 - y2 eliminated)."""
+    y1, y2 = y[0], y[1]
+    y3 = 1.0 - y1 - y2
+    return np.array([
+        [-0.04 - 1e4 * y2, 1e4 * (y3 - y2)],
+        [0.04 + 1e4 * y2, -1e4 * (y3 - y2) - 6e7 * y2],
+    ])
+
+
+def split_eigenvalues(J):
+    """Return (nonzero, zero) eigenvalues of J using a stated relative threshold."""
+    e = np.linalg.eigvals(J)
+    scale = np.max(np.abs(e))
+    if scale == 0.0:
+        return e, np.array([], dtype=complex)
+    mask = np.abs(e) > ZERO_REL * scale
+    return e[mask], e[~mask]
+
+
+def reference_solution():
+    """Tight reference with tolerance and independent-method checks."""
+    tight = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="Radau",
+                      rtol=1e-12, atol=1e-14, dense_output=True)
+    baseline = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="Radau",
+                         rtol=1e-10, atol=1e-12, dense_output=True)
+    bdf = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="BDF",
+                    rtol=1e-12, atol=1e-14)
+    probe = np.logspace(-8, np.log10(T_END), 500)
+    diff = np.max(np.abs(tight.sol(probe) - baseline.sol(probe)))
+    method_diff = np.max(np.abs(tight.y[:, -1] - bdf.y[:, -1]))
+    ok = tight.success and baseline.success and bdf.success and diff < 1e-8
+    print(f"[0] reference tolerance check (100x): max|tight - baseline| = {diff:.2e}  "
+          f"-> {'PASS' if ok else 'FAIL'}")
+    print(f"    independent-method check: max|Radau - BDF| at t=40 = "
+          f"{method_diff:.2e}")
+    return tight, diff
+
+
+def main():
+    print("=" * 68)
+    print("robertson_stiffness.py - nonzero eigenvalues and stiffness ratio")
+    print("=" * 68)
+
+    ref, _ = reference_solution()
+
+    t = np.logspace(-8, np.log10(T_END), 500)
+    Y = ref.sol(t)
+
+    lam1, lam2, ratio = [], [], []
+    red1, red2 = [], []
+    for ti, yi in zip(t, Y.T):
+        nz, zero = split_eigenvalues(robertson_jacobian(ti, yi))
+        re = np.sort(np.abs(nz.real))[::-1]          # descending |Re lambda|
+        lam1.append(re[0])
+        lam2.append(re[1] if len(re) > 1 else np.nan)
+        ratio.append(re[0] / re[1] if len(re) > 1 and re[1] > 0 else np.nan)
+        rr = np.sort(np.abs(np.linalg.eigvals(reduced_jacobian(yi)).real))[::-1]
+        red1.append(rr[0])
+        red2.append(rr[1])
+
+    lam1 = np.array(lam1); lam2 = np.array(lam2); ratio = np.array(ratio)
+    red1 = np.array(red1); red2 = np.array(red2)
+
+    # ---- check values ------------------------------------------------
+    print("\n  t        |Re lambda|max    |Re lambda|min    S(t)        S (pack)")
+    print("  " + "-" * 64)
+    for tc, sc in zip(CHECK_T, CHECK_S):
+        i = int(np.argmin(np.abs(t - tc)))
+        print(f"  {tc:<8g} {lam1[i]:<18.3e} {lam2[i]:<18.3e} {ratio[i]:<11.3e} {sc:.2e}")
+    i40 = int(np.argmin(np.abs(t - T_END)))
+    print(f"\n  |Re lambda|max at t=40 : {lam1[i40]:.3e}   (pack: ~3.39e3)")
+    print(f"  explicit-Euler bound   : h < 2/{lam1[i40]:.3e} = "
+          f"{2.0/lam1[i40]:.2e}   (pack: ~5.9e-4)")
+    print(f"  reduced 2x2 agreement  : max rel. diff = "
+          f"{np.nanmax(np.abs(red1 - lam1) / lam1):.2e}")
+
+    # ---- figure ------------------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.8))
+
+    ax1.loglog(t, lam1, "-", color="tab:red", lw=2, label=r"$|\mathrm{Re}\,\lambda|_{\max}$ (full 3x3)")
+    ax1.loglog(t, lam2, "-", color="tab:blue", lw=2, label=r"$|\mathrm{Re}\,\lambda|_{\min}$ (nonzero)")
+    ax1.loglog(t, red1, "--", color="k", lw=1, alpha=0.7, label="reduced 2x2 (max / min)")
+    ax1.loglog(t, red2, "--", color="k", lw=1, alpha=0.7)
+    ax1.axhline(3.39e3, color="gray", ls=":", lw=1.2)
+    ax1.annotate("pack check value ~3.39e3 at t=40",
+                 xy=(t[-1], 3.39e3), xytext=(1e-5, 1.2e4),
+                 arrowprops=dict(arrowstyle="->", color="gray"), color="gray", fontsize=9)
+    ax1.set_xlabel("time t (log scale)")
+    ax1.set_ylabel(r"$|\mathrm{Re}\,\lambda|$")
+    ax1.set_title("Nonzero Jacobian eigenvalues\n(structural zero eigenvalue excluded)")
+    ax1.grid(True, which="both", ls=":", alpha=0.5)
+    ax1.legend(fontsize=9, loc="lower right")
+
+    ax2.loglog(t, ratio, "-", color="tab:purple", lw=2, label=r"$S(t)=\max|\mathrm{Re}\lambda|/\min|\mathrm{Re}\lambda|$")
+    ax2.loglog(CHECK_T, CHECK_S, "x", color="k", ms=9, mew=2, label="problem-pack check values")
+    for tc, sc in zip(CHECK_T, CHECK_S):
+        ax2.annotate(f"{sc:.1e}", xy=(tc, sc), xytext=(tc * 1.3, sc * 1.6), fontsize=9)
+    ax2.set_xlabel("time t (log scale)")
+    ax2.set_ylabel(r"stiffness ratio $S(t)$")
+    ax2.set_title("Stiffness ratio from the two nonzero eigenvalues\n(starts at the first positive log time - initial state is degenerate)")
+    ax2.grid(True, which="both", ls=":", alpha=0.5)
+    ax2.legend(fontsize=9, loc="lower right")
+
+    fig.suptitle("Robertson problem: eigenanalysis along a tight-tolerance reference (Radau, rtol=1e-12)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig("robertson_stiffness.png", dpi=150)
+    plt.close(fig)
+    print("\nFigure written: robertson_stiffness.png")
+    print("=" * 68)
+
+
+if __name__ == "__main__":
+    main()
+"""
+robertson_y2_tolerance.py — Problem Pack ③ (Robertson): y2 at several
+tolerances, plus a Newton stopping-tolerance sweep.
+
+Covers two requirements:
+    * "The final value of y2 reported by your implicit method at several
+       tolerances, cross-checked against your own high-accuracy reference."
+    * Sanity check: an inexact nonlinear solve produces an invariant defect
+       controlled by the nonlinear residual; choose the Newton stopping
+       tolerance small enough that algebraic error is negligible relative to
+       the time-discretisation error, then demonstrate it with a sweep.
+
+Three error sources are separated explicitly:
+    time discretisation (grows with h, ~ O(h) for implicit Euler)
+    algebraic / Newton   (controlled by the stopping tolerance)
+    reference            (Radau at rtol=1e-12, verified by a 100x
+                          tolerance-tightening repeat)
+
+Run:  python robertson_y2_tolerance.py
+Outputs: robertson_y2_tolerance.png, robertson_algebraic_error.png
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+Y0 = np.array([1.0, 0.0, 0.0])
+T_END = 40.0
+H_LIST = [0.4, 0.2, 0.1, 0.05]
+NEWTON_TOLS = [1e-2, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12, 1e-14]
+
+
+def robertson_rhs(t, y):
+    y1, y2, y3 = y
+    return np.array([
+        -0.04 * y1 + 1e4 * y2 * y3,
+        0.04 * y1 - 1e4 * y2 * y3 - 3e7 * y2 * y2,
+        3e7 * y2 * y2,
+    ])
+
+
+def robertson_jacobian(t, y):
+    y1, y2, y3 = y
+    return np.array([
+        [-0.04, 1e4 * y3, 1e4 * y2],
+        [0.04, -1e4 * y3 - 6e7 * y2, -1e4 * y2],
+        [0.0, 6e7 * y2, 0.0],
+    ])
+
+
+def newton_solve(t_next, y_n, h, tol):
+    """Implicit-Euler step; returns (y_next, iterations, converged)."""
+    w = y_n.copy()
+    for k in range(60):
+        F = w - y_n - h * robertson_rhs(t_next, w)
+        if np.linalg.norm(F, np.inf) < tol:
+            return w, k, True
+        JF = np.eye(3) - h * robertson_jacobian(t_next, w)
+        w = w - np.linalg.solve(JF, F)
+    return w, 60, False
+
+
+def implicit_run(h, newton_tol):
+    n = int(np.ceil(T_END / h))
+    t = 0.0
+    y = Y0.copy()
+    defect = 0.0          # max |sum(y) - 1|  (invariant defect)
+    max_iter = 0
+    total_iter = 0
+    for _ in range(n):
+        step = min(h, T_END - t)
+        y, its, ok = newton_solve(t + step, y, step, newton_tol)
+        max_iter = max(max_iter, its)
+        total_iter += its
+        if not ok:
+            return None
+        t += step
+        defect = max(defect, abs(float(np.sum(y)) - 1.0))
+    return {"y": y, "defect": defect, "max_iter": max_iter,
+            "total_iter": total_iter, "steps": n}
+
+
+def reference_solution():
+    baseline = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="Radau",
+                         rtol=1e-10, atol=1e-12)
+    tight = solve_ivp(robertson_rhs, (0.0, T_END), Y0, method="Radau",
+                      rtol=1e-12, atol=1e-14)
+    diff = float(np.max(np.abs(baseline.y[:, -1] - tight.y[:, -1])))
+    print(f"[0] reference check: Radau(1e-10) vs Radau(1e-12), 100x tighter: "
+          f"max component difference = {diff:.2e}")
+    print(f"    reference y(40) = {tight.y[:, -1]}   "
+          f"(pack orientation: 0.7158271, 9.1855e-6, 0.2841637)")
+    return tight.y[:, -1], diff
+
+
+def main():
+    print("=" * 74)
+    print("robertson_y2_tolerance.py - y2(40) toward the reference, and the")
+    print("                           Newton stopping-tolerance sweep")
+    print("=" * 74)
+
+    y_ref, ref_diff = reference_solution()
+    digits = -int(np.floor(np.log10(max(ref_diff, 1e-16)))) - 1
+    print(f"    -> digits stable under that repeat: about {max(digits,0)} decimals")
+
+    # ---------------- table: y2(40) vs (h, Newton tol) ----------------
+    print(f"\n  y2(40) for each (h, Newton stopping tolerance)")
+    print(f"  {'h':>6} " + "".join(f"{t:>13.0e}" for t in NEWTON_TOLS))
+    print("  " + "-" * (7 + 13 * len(NEWTON_TOLS)))
+    results = {}
+    for h in H_LIST:
+        cells = []
+        for tol in NEWTON_TOLS:
+            r = implicit_run(h, tol)
+            results[(h, tol)] = r
+            if r is None:
+                cells.append("   diverged   ")
+            elif r["total_iter"] == 0:
+                # Newton stopped before taking a single update: the returned
+                # state is still y_n, so the run is meaningless
+                cells.append("   stalled    ")
+            else:
+                cells.append(f"{r['y'][1]:>13.6e}")
+        print(f"  {h:>6.2f} " + "".join(cells))
+    print(f"  {'ref':>6}    " + f"{y_ref[1]:>13.6e}   (tight-tolerance reference)")
+
+    # ---------------- algebraic vs time error -------------------------
+    print(f"\n  error decomposition at h = 0.1")
+    print(f"  {'Newton tol':>12} {'total iters':>12} {'max/step':>9} "
+          f"{'defect max|sum-1|':>19} {'||err(40)||inf':>16} {'y2(40)':>14}")
+    print("  " + "-" * 88)
+    for tol in NEWTON_TOLS:
+        r = results[(0.1, tol)]
+        if r is None:
+            print(f"  {tol:>12.0e} {'-':>12} {'-':>9} {'-':>19} {'diverged':>16} {'-':>14}")
+            continue
+        err = float(np.max(np.abs(r["y"] - y_ref)))
+        flag = "  <- stalled: no Newton update taken" if r["total_iter"] == 0 else ""
+        print(f"  {tol:>12.0e} {r['total_iter']:>12} {r['max_iter']:>9} "
+              f"{r['defect']:>19.2e} {err:>16.3e} {r['y'][1]:>14.6e}{flag}")
+
+    # ---------------- figure 1: convergence of y2 ---------------------
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.8))
+    tol_tight = 1e-12
+    hs, errs, y2s = [], [], []
+    for h in H_LIST:
+        r = results[(h, tol_tight)]
+        if r is None:
+            continue
+        hs.append(h); errs.append(float(np.max(np.abs(r["y"] - y_ref)))); y2s.append(r["y"][1])
+    hs = np.array(hs); errs = np.array(errs)
+    ax1.loglog(hs, errs, "o-", color="tab:red", label="implicit Euler, ||err(40)||inf")
+    slope = np.polyfit(np.log(hs), np.log(errs), 1)[0]
+    c = errs[0] / hs[0]
+    hl = np.logspace(np.log10(hs.min()), np.log10(hs.max()), 40)
+    ax1.loglog(hl, c * hl, "k--", lw=1.2, label=f"order-1 reference (fit slope {slope:.2f})")
+    ax1.set_xlabel("step size h"); ax1.set_ylabel("global error at T=40")
+    ax1.set_title("Implicit Euler converges at first order\n(Newton tolerance fixed at 1e-12)")
+    ax1.grid(True, which="both", ls=":", alpha=0.5); ax1.legend(fontsize=9)
+
+    ax2.semilogx(hs, y2s, "o-", color="tab:blue", label="y2(40), implicit Euler")
+    ax2.axhline(y_ref[1], color="k", ls="--", lw=1.2,
+                label=f"reference y2(40) = {y_ref[1]:.6e}")
+    ax2.set_xlabel("step size h"); ax2.set_ylabel("y2(40)")
+    ax2.set_title("The small component y2(40) approaches the reference\n(asymptotically from above)")
+    ax2.grid(True, which="both", ls=":", alpha=0.5); ax2.legend(fontsize=9)
+    fig.suptitle("Robertson: y2(40) at several step sizes, cross-checked against a tight reference", fontsize=12)
+    fig.tight_layout(); fig.savefig("robertson_y2_tolerance.png", dpi=150); plt.close(fig)
+
+    # ---------------- figure 2: Newton tolerance sweep ----------------
+    fig2, (bx1, bx2) = plt.subplots(1, 2, figsize=(13, 4.8))
+    for h, mk in zip(H_LIST, ["o", "s", "^", "d"]):
+        xs, ds, es = [], [], []
+        for tol in NEWTON_TOLS:
+            r = results[(h, tol)]
+            if r is None:
+                continue
+            xs.append(tol); ds.append(max(r["defect"], 1e-18))
+            es.append(max(float(np.max(np.abs(r["y"] - y_ref))), 1e-18))
+        bx1.loglog(xs, ds, mk + "-", label=f"h = {h:g}")
+        bx2.loglog(xs, es, mk + "-", label=f"h = {h:g}")
+    bx1.set_xlabel("Newton stopping tolerance  ||F||inf < tol")
+    bx1.set_ylabel("max invariant defect |sum(y) - 1|")
+    bx1.set_title("Algebraic error is controlled by the Newton tolerance\n(machine-level once tol is small enough)")
+    bx1.grid(True, which="both", ls=":", alpha=0.5); bx1.legend(fontsize=9)
+    bx2.set_xlabel("Newton stopping tolerance")
+    bx2.set_ylabel("total error at T=40")
+    bx2.set_title("Choose tol so algebraic error is negligible\nvs the time-discretisation error")
+    bx2.grid(True, which="both", ls=":", alpha=0.5); bx2.legend(fontsize=9)
+    fig2.suptitle("Robertson: Newton stopping tolerance - how small is small enough?", fontsize=12)
+    fig2.tight_layout(); fig2.savefig("robertson_algebraic_error.png", dpi=150); plt.close(fig2)
+
+    # ---------------- verdict -----------------------------------------
+    r_tight = results[(0.1, 1e-12)]
+    r_loose = results[(0.1, 1e-2)]
+    print("\n  verdict")
+    if r_tight:
+        print(f"    h=0.1, tol=1e-12: defect {r_tight['defect']:.2e}, "
+              f"{r_tight['total_iter']} Newton iterations total, "
+              f"max {r_tight['max_iter']} per step")
+    if r_loose:
+        err_loose = float(np.max(np.abs(r_loose["y"] - y_ref)))
+        print(f"    h=0.1, tol=1e-2 : defect {r_loose['defect']:.2e} "
+              f"(looks perfect!) but {r_loose['total_iter']} Newton iterations "
+              f"and error {err_loose:.2e}")
+        print("      -> a loose tolerance lets Newton stop before taking a single")
+        print("         update, so the state never advances. The invariant defect is")
+        print("         then exactly zero while the answer is completely wrong:")
+        print("         conservation is a WEAK diagnostic (problem pack wording).")
+    print("    recommendation: stop Newton at ||F||inf <= 1e-10 or tighter, where the")
+    print("    defect reaches machine level and y2(40) stops changing with tol;")
+    print("    the remaining error is then purely the time-discretisation error.")
+    print("\nFigures written: robertson_y2_tolerance.png, robertson_algebraic_error.png")
+    print("=" * 74)
+
+
+if __name__ == "__main__":
+    main()
